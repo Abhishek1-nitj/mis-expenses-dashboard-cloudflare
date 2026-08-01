@@ -89,6 +89,17 @@ function App() {
   </main>;
 }
 
-const money = (n: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n);
+function money(n: number) {
+  const v = Math.abs(n);
+  const sign = n < 0 ? "-" : "";
+  if (v >= 1e7) return `${sign}₹${trim(v / 1e7)} cr`;
+  if (v >= 1e5) return `${sign}₹${trim(v / 1e5)}L`;
+  if (v >= 1e3) return `${sign}₹${trim(v / 1e3)}k`;
+  return `${sign}₹${Math.round(v)}`;
+}
+
+function trim(n: number) {
+  return n.toFixed(n >= 10 ? 1 : 2).replace(/\.0$|0$/g, "");
+}
 
 createRoot(document.getElementById("root")!).render(<App />);
