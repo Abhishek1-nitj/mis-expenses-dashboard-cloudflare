@@ -55,8 +55,7 @@ function App() {
   return <main>
     <section className="top">
       <div>
-        <p className="eyebrow">MIS expense intelligence</p>
-        <h1>ISKCON Whitefield</h1>
+        <h1>ISKCON Whitefield Expenses</h1>
       </div>
       <button onClick={sync} disabled={syncing}><RefreshCw size={18} className={syncing ? "spin" : ""}/> Sync data</button>
     </section>
