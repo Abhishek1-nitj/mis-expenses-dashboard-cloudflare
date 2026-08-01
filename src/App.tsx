@@ -40,12 +40,6 @@ function App() {
   const peak = useMemo(() => months.reduce<Month | null>((m, r) => !m || r.total > m.total ? r : m, null), [months]);
   const avg = useMemo(() => months.length ? months.reduce((s, r) => s + r.total, 0) / months.length : 0, [months]);
   const maxMonth = useMemo(() => months.reduce((m, r) => Math.max(m, r.total), 0), [months]);
-  const median = useMemo(() => {
-    if (!months.length) return 0;
-    const sorted = months.map((m) => m.total).sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-  }, [months]);
 
   async function sync() {
     setSyncing(true);
@@ -62,7 +56,7 @@ function App() {
     <section className="top">
       <div>
         <p className="eyebrow">MIS expense intelligence</p>
-        <h1>Project and monthwise dashboard</h1>
+        <h1>ISKCON Whitefield</h1>
       </div>
       <button onClick={sync} disabled={syncing}><RefreshCw size={18} className={syncing ? "spin" : ""}/> Sync data</button>
     </section>
@@ -94,7 +88,6 @@ function App() {
     <section className="stats">
       <article><WalletCards/><span>Total expense</span><strong>{money(total.total || 0)}</strong></article>
       <article><span>Avg expense per month</span><strong>{money(avg)}</strong></article>
-      <article><span>Median expense per month</span><strong>{money(median)}</strong></article>
       <article><span>Peak month</span><strong>{peak ? peak.month : "-"}</strong><em>{money(peak?.total || 0)}</em></article>
     </section>
 
