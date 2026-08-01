@@ -61,27 +61,33 @@ function App() {
     </section>
 
     <section className="controls">
-      <label>Classification</label>
-      <select value={classification} onChange={(e) => { setClassification(e.target.value); setProject("__all"); }}>
-        <option value="__all">All categories</option>
-        {classes.map((c) => <option key={c.classification}>{c.classification}</option>)}
-      </select>
-      <label>Project</label>
-      <select value={project} onChange={(e) => setProject(e.target.value)}>
-        <option value="__all">All projects</option>
-        {projects.map((p) => <option key={p.project}>{p.project}</option>)}
-      </select>
-      <label>Date</label>
-      <select value={date} onChange={(e) => setDate(e.target.value)}>
-        <option value="all">All dates</option>
-        <option value="7d">Last 7 days</option>
-        <option value="30d">Last 30 days</option>
-        <option value="3m">Last 3 months</option>
-        <option value="6m">Last 6 months</option>
-        <option value="1y">Last 1 year</option>
-        <option value="custom">Custom range</option>
-      </select>
-      {date === "custom" && <><input type="date" value={start} onChange={(e) => setStart(e.target.value)}/><input type="date" value={end} onChange={(e) => setEnd(e.target.value)}/></>}
+      <div className="field">
+        <label>Classification</label>
+        <select value={classification} onChange={(e) => { setClassification(e.target.value); setProject("__all"); }}>
+          <option value="__all">All categories</option>
+          {classes.map((c) => <option key={c.classification}>{c.classification}</option>)}
+        </select>
+      </div>
+      <div className="field">
+        <label>Project</label>
+        <select value={project} onChange={(e) => setProject(e.target.value)}>
+          <option value="__all">All projects</option>
+          {projects.map((p) => <option key={p.project}>{p.project}</option>)}
+        </select>
+      </div>
+      <div className="field">
+        <label>Date</label>
+        <select value={date} onChange={(e) => setDate(e.target.value)}>
+          <option value="all">All dates</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+          <option value="3m">Last 3 months</option>
+          <option value="6m">Last 6 months</option>
+          <option value="1y">Last 1 year</option>
+          <option value="custom">Custom range</option>
+        </select>
+      </div>
+      {date === "custom" && <div className="field custom"><label>Range</label><div><input type="date" value={start} onChange={(e) => setStart(e.target.value)}/><input type="date" value={end} onChange={(e) => setEnd(e.target.value)}/></div></div>}
     </section>
 
     <section className="stats">
