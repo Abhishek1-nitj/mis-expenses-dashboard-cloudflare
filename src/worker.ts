@@ -12,8 +12,8 @@ export default {
     const url = new URL(req.url);
     if (url.pathname === "/api/sync" && req.method === "POST") return json(await sync(env));
     if (url.pathname === "/api/classifications") return json(await classifications(env));
-    if (url.pathname === "/api/projects") return json(await projects(env, url.searchParams.get("classification") || ""));
-    if (url.pathname === "/api/summary") return json(await summary(env, url.searchParams.get("classification") || "", url.searchParams.get("project") || ""));
+    if (url.pathname === "/api/projects") return json(await projects(env, url.searchParams.get("classification") || "", dateWhere(url)));
+    if (url.pathname === "/api/summary") return json(await summary(env, url.searchParams.get("classification") || "", url.searchParams.get("project") || "", dateWhere(url)));
     if (url.pathname === "/api/status") return json(await status(env));
     const res = await env.ASSETS.fetch(req);
     const headers = new Headers(res.headers);
@@ -132,19 +132,32 @@ async function classifications(env: Env) {
   return rows.results;
 }
 
-async function projects(env: Env, classification: string) {
+function dateWhere(url: URL) {
+  const preset = url.searchParams.get("date") || "all";
+  const end = url.searchParams.get("end") || new Date().toISOString().slice(0, 10);
+  const startParam = url.searchParams.get("start") || "";
+  const d = new Date(end + "T00:00:00Z");
+  const days: Record<string, number> = { "7d": 7, "30d": 30, "3m": 92, "6m": 183, "1y": 365 };
+  if (preset === "custom" && startParam) return { sql: "expense_date BETWEEN ? AND ?", bind: [startParam, end] };
+  if (!days[preset]) return { sql: "1=1", bind: [] as string[] };
+  d.setUTCDate(d.getUTCDate() - days[preset] + 1);
+  return { sql: "expense_date BETWEEN ? AND ?", bind: [d.toISOString().slice(0, 10), end] };
+}
+
+async function projects(env: Env, classification: string, date: { sql: string; bind: string[] }) {
   const all = classification === "__all";
   const rows = all
-    ? await env.DB.prepare("SELECT project, ROUND(SUM(amount),2) total FROM expenses GROUP BY project ORDER BY project").all()
-    : await env.DB.prepare("SELECT project, ROUND(SUM(amount),2) total FROM expenses WHERE classification=? GROUP BY project ORDER BY project").bind(classification).all();
+    ? await env.DB.prepare(`SELECT project, ROUND(SUM(amount),2) total FROM expenses WHERE ${date.sql} GROUP BY project ORDER BY project`).bind(...date.bind).all()
+    : await env.DB.prepare(`SELECT project, ROUND(SUM(amount),2) total FROM expenses WHERE classification=? AND ${date.sql} GROUP BY project ORDER BY project`).bind(classification, ...date.bind).all();
   return rows.results;
 }
 
-async function summary(env: Env, classification: string, project: string) {
+async function summary(env: Env, classification: string, project: string, date: { sql: string; bind: string[] }) {
   const allClass = classification === "__all";
   const allProject = !project || project === "__all";
-  const where = allClass ? (allProject ? "1=1" : "project=?") : (allProject ? "classification=?" : "classification=? AND project=?");
-  const bind = allClass ? (allProject ? [] : [project]) : (allProject ? [classification] : [classification, project]);
+  const base = allClass ? (allProject ? "1=1" : "project=?") : (allProject ? "classification=?" : "classification=? AND project=?");
+  const where = `${base} AND ${date.sql}`;
+  const bind = [...(allClass ? (allProject ? [] : [project]) : (allProject ? [classification] : [classification, project])), ...date.bind];
   const rows = await env.DB.prepare(`SELECT month_key monthKey, month_label month, ROUND(SUM(amount),2) total FROM expenses WHERE ${where} GROUP BY month_key, month_label ORDER BY month_key`).bind(...bind).all();
   const total = await env.DB.prepare(`SELECT ROUND(SUM(amount),2) total, COUNT(*) rows FROM expenses WHERE ${where}`).bind(...bind).first();
   return { classification: allClass ? "All categories" : classification, project: allProject ? "All projects" : project, total, months: rows.results };

@@ -12,6 +12,9 @@ function App() {
   const [classification, setClassification] = useState("");
   const [projects, setProjects] = useState<Project[]>([]);
   const [project, setProject] = useState("__all");
+  const [date, setDate] = useState("all");
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState(new Date().toISOString().slice(0, 10));
   const [months, setMonths] = useState<Month[]>([]);
   const [total, setTotal] = useState<{ total: number; rows: number }>({ total: 0, rows: 0 });
   const [syncing, setSyncing] = useState(false);
@@ -22,16 +25,17 @@ function App() {
     const activeClass = classification || "__all";
     if (!classification) setClassification(activeClass);
     if (!activeClass) return;
-    const ps = await fetch(`/api/projects?classification=${encodeURIComponent(activeClass)}`).then((r) => r.json()) as Project[];
+    const qs = dateQs(activeClass, project, date, start, end);
+    const ps = await fetch(`/api/projects?${qs}`).then((r) => r.json()) as Project[];
     setProjects(ps);
     const activeProject = project;
-    const s = await fetch(`/api/summary?classification=${encodeURIComponent(activeClass)}&project=${encodeURIComponent(activeProject)}`).then((r) => r.json());
+    const s = await fetch(`/api/summary?${dateQs(activeClass, activeProject, date, start, end)}`).then((r) => r.json());
     setMonths(s.months);
     setTotal(s.total || { total: 0, rows: 0 });
   }
 
   useEffect(() => { load(); }, []);
-  useEffect(() => { if (classification) load(); }, [classification, project]);
+  useEffect(() => { if (classification) load(); }, [classification, project, date, start, end]);
 
   const peak = useMemo(() => months.reduce<Month | null>((m, r) => !m || r.total > m.total ? r : m, null), [months]);
   const avg = useMemo(() => months.length ? months.reduce((s, r) => s + r.total, 0) / months.length : 0, [months]);
@@ -73,11 +77,21 @@ function App() {
         <option value="__all">All projects</option>
         {projects.map((p) => <option key={p.project}>{p.project}</option>)}
       </select>
+      <label>Date</label>
+      <select value={date} onChange={(e) => setDate(e.target.value)}>
+        <option value="all">All dates</option>
+        <option value="7d">Last 7 days</option>
+        <option value="30d">Last 30 days</option>
+        <option value="3m">Last 3 months</option>
+        <option value="6m">Last 6 months</option>
+        <option value="1y">Last 1 year</option>
+        <option value="custom">Custom range</option>
+      </select>
+      {date === "custom" && <><input type="date" value={start} onChange={(e) => setStart(e.target.value)}/><input type="date" value={end} onChange={(e) => setEnd(e.target.value)}/></>}
     </section>
 
     <section className="stats">
       <article><WalletCards/><span>Total expense</span><strong>{money(total.total || 0)}</strong></article>
-      <article><span>Months</span><strong>{months.length}</strong></article>
       <article><span>Avg expense per month</span><strong>{money(avg)}</strong></article>
       <article><span>Median expense per month</span><strong>{money(median)}</strong></article>
       <article><span>Peak month</span><strong>{peak ? peak.month : "-"}</strong><em>{money(peak?.total || 0)}</em></article>
@@ -101,6 +115,12 @@ function money(n: number) {
 
 function trim(n: number) {
   return n.toFixed(n >= 10 ? 1 : 2).replace(/\.0$|0$/g, "");
+}
+
+function dateQs(classification: string, project: string, date: string, start: string, end: string) {
+  const q = new URLSearchParams({ classification, project, date, end });
+  if (date === "custom" && start) q.set("start", start);
+  return q.toString();
 }
 
 createRoot(document.getElementById("root")!).render(<App />);
