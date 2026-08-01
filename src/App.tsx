@@ -33,7 +33,7 @@ function App() {
   useEffect(() => { load(); }, []);
   useEffect(() => { if (classification) load(); }, [classification, project]);
 
-  const peak = useMemo(() => months.reduce((m, r) => Math.max(m, r.total), 0), [months]);
+  const peak = useMemo(() => months.reduce<Month | null>((m, r) => !m || r.total > m.total ? r : m, null), [months]);
   const avg = useMemo(() => months.length ? months.reduce((s, r) => s + r.total, 0) / months.length : 0, [months]);
   const median = useMemo(() => {
     if (!months.length) return 0;
@@ -80,7 +80,7 @@ function App() {
       <article><span>Months</span><strong>{months.length}</strong></article>
       <article><span>Avg expense per month</span><strong>{money(avg)}</strong></article>
       <article><span>Median expense per month</span><strong>{money(median)}</strong></article>
-      <article><span>Peak month</span><strong>{money(peak)}</strong></article>
+      <article><span>Peak month</span><strong>{peak ? peak.month : "-"}</strong><em>{money(peak?.total || 0)}</em></article>
     </section>
 
     <section className="table">
