@@ -10,8 +10,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "REPLACE_WITH_D1_DATABASE_NAME",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_name": "mis_expenses_dashboard",
+      "database_id": "6db2e97c-aa14-4deb-8bd2-0f0d7a5d6410"
     }
   ],
   "vars": {
