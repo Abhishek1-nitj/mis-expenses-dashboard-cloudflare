@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { RefreshCw, WalletCards } from "lucide-react";
-import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import "./style.css";
 
 type Classification = { classification: string; total: number };
@@ -35,6 +34,13 @@ function App() {
   useEffect(() => { if (classification) load(); }, [classification, project]);
 
   const peak = useMemo(() => months.reduce((m, r) => Math.max(m, r.total), 0), [months]);
+  const avg = useMemo(() => months.length ? months.reduce((s, r) => s + r.total, 0) / months.length : 0, [months]);
+  const median = useMemo(() => {
+    if (!months.length) return 0;
+    const sorted = months.map((m) => m.total).sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  }, [months]);
 
   async function sync() {
     setSyncing(true);
@@ -70,22 +76,10 @@ function App() {
 
     <section className="stats">
       <article><WalletCards/><span>Total expense</span><strong>{money(total.total || 0)}</strong></article>
-      <article><span>Rows synced</span><strong>{total.rows || 0}</strong></article>
       <article><span>Months</span><strong>{months.length}</strong></article>
+      <article><span>Avg expense per month</span><strong>{money(avg)}</strong></article>
+      <article><span>Median expense per month</span><strong>{money(median)}</strong></article>
       <article><span>Peak month</span><strong>{money(peak)}</strong></article>
-    </section>
-
-    <section className="chart">
-      <ResponsiveContainer width="100%" height={360}>
-        <AreaChart data={months}>
-          <defs><linearGradient id="g" x1="0" x2="0" y1="0" y2="1"><stop offset="5%" stopColor="#0e9f6e" stopOpacity=".55"/><stop offset="95%" stopColor="#0e9f6e" stopOpacity=".04"/></linearGradient></defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#d9e2df"/>
-          <XAxis dataKey="month" tickLine={false}/>
-          <YAxis tickFormatter={(v) => `₹${Math.round(Number(v)/1000)}k`} tickLine={false}/>
-          <Tooltip formatter={(v) => money(Number(v))}/>
-          <Area type="monotone" dataKey="total" stroke="#0e9f6e" strokeWidth={3} fill="url(#g)"/>
-        </AreaChart>
-      </ResponsiveContainer>
     </section>
 
     <section className="table">
