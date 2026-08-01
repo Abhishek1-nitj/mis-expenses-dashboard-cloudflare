@@ -4,30 +4,35 @@ import { RefreshCw, WalletCards } from "lucide-react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import "./style.css";
 
+type Classification = { classification: string; total: number };
 type Project = { project: string; total: number };
 type Month = { monthKey: string; month: string; total: number };
 
 function App() {
+  const [classes, setClasses] = useState<Classification[]>([]);
+  const [classification, setClassification] = useState("");
   const [projects, setProjects] = useState<Project[]>([]);
-  const [project, setProject] = useState("");
+  const [project, setProject] = useState("__all");
   const [months, setMonths] = useState<Month[]>([]);
   const [total, setTotal] = useState<{ total: number; rows: number }>({ total: 0, rows: 0 });
   const [syncing, setSyncing] = useState(false);
 
   async function load() {
-    const ps = await fetch("/api/projects").then((r) => r.json()) as Project[];
+    const cs = await fetch("/api/classifications").then((r) => r.json()) as Classification[];
+    setClasses(cs);
+    const activeClass = classification || cs[0]?.classification || "";
+    if (!classification) setClassification(activeClass);
+    if (!activeClass) return;
+    const ps = await fetch(`/api/projects?classification=${encodeURIComponent(activeClass)}`).then((r) => r.json()) as Project[];
     setProjects(ps);
-    const active = project || ps[0]?.project || "";
-    if (!project) setProject(active);
-    if (active) {
-      const s = await fetch(`/api/summary?project=${encodeURIComponent(active)}`).then((r) => r.json());
-      setMonths(s.months);
-      setTotal(s.total || { total: 0, rows: 0 });
-    }
+    const activeProject = project;
+    const s = await fetch(`/api/summary?classification=${encodeURIComponent(activeClass)}&project=${encodeURIComponent(activeProject)}`).then((r) => r.json());
+    setMonths(s.months);
+    setTotal(s.total || { total: 0, rows: 0 });
   }
 
   useEffect(() => { load(); }, []);
-  useEffect(() => { if (project) load(); }, [project]);
+  useEffect(() => { if (classification) load(); }, [classification, project]);
 
   const peak = useMemo(() => months.reduce((m, r) => Math.max(m, r.total), 0), [months]);
 
@@ -52,8 +57,13 @@ function App() {
     </section>
 
     <section className="controls">
+      <label>Classification</label>
+      <select value={classification} onChange={(e) => { setClassification(e.target.value); setProject("__all"); }}>
+        {classes.map((c) => <option key={c.classification}>{c.classification}</option>)}
+      </select>
       <label>Project</label>
       <select value={project} onChange={(e) => setProject(e.target.value)}>
+        <option value="__all">All projects</option>
         {projects.map((p) => <option key={p.project}>{p.project}</option>)}
       </select>
     </section>

@@ -11,8 +11,9 @@ export default {
   async fetch(req: Request, env: Env) {
     const url = new URL(req.url);
     if (url.pathname === "/api/sync" && req.method === "POST") return json(await sync(env));
-    if (url.pathname === "/api/projects") return json(await projects(env));
-    if (url.pathname === "/api/summary") return json(await summary(env, url.searchParams.get("project") || ""));
+    if (url.pathname === "/api/classifications") return json(await classifications(env));
+    if (url.pathname === "/api/projects") return json(await projects(env, url.searchParams.get("classification") || ""));
+    if (url.pathname === "/api/summary") return json(await summary(env, url.searchParams.get("classification") || "", url.searchParams.get("project") || ""));
     if (url.pathname === "/api/status") return json(await status(env));
     return env.ASSETS.fetch(req);
   },
@@ -21,6 +22,7 @@ export default {
 async function sync(env: Env) {
   const token = await accessToken(env);
   const now = new Date().toISOString();
+  const classMap = await syncClassifications(env, token, now);
   let processed = 0;
   let hasMore = false;
   const limit = 700;
@@ -40,8 +42,8 @@ async function sync(env: Env) {
       lastRow = rowNo;
       if (!parsed) continue;
       statements.push(env.DB.prepare(
-        "INSERT OR IGNORE INTO expenses (id,source,source_row,project,month_key,month_label,expense_date,amount,merchant,category,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-      ).bind(parsed.id, sheet, rowNo, parsed.project, parsed.monthKey, parsed.monthLabel, parsed.date, parsed.amount, parsed.merchant, parsed.category, JSON.stringify(row), now));
+        "INSERT OR IGNORE INTO expenses (id,source,source_row,project,classification,month_key,month_label,expense_date,amount,merchant,category,raw_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      ).bind(parsed.id, sheet, rowNo, parsed.project, classMap.get(key(parsed.project)) || "Unclassified", parsed.monthKey, parsed.monthLabel, parsed.date, parsed.amount, parsed.merchant, parsed.category, JSON.stringify(row), now));
       processed++;
     }
     for (let i = 0; i < statements.length; i += 100) await env.DB.batch(statements.slice(i, i + 100));
@@ -51,7 +53,38 @@ async function sync(env: Env) {
     }
     if (rows.length > lastRow) hasMore = true;
   }
-  return { processed, hasMore, syncedAt: now };
+  await backfillClassifications(env);
+  return { processed, hasMore, classifications: classMap.size, syncedAt: now };
+}
+
+async function syncClassifications(env: Env, token: string, now: string) {
+  const rows = await sheetValues(env.SPREADSHEET_ID, "Project Classification!A1:Y965", token);
+  const headers = rows[0] || [];
+  const statements = [];
+  const map = new Map<string, string>();
+  for (let c = 0; c < headers.length; c++) {
+    const classification = clean(headers[c]);
+    if (!classification) continue;
+    for (let r = 1; r < rows.length; r++) {
+      const project = clean(rows[r]?.[c]);
+      if (!project) continue;
+      const projectKey = key(project);
+      map.set(projectKey, classification);
+      statements.push(env.DB.prepare("INSERT INTO project_classifications(project_key,project,classification,updated_at) VALUES(?,?,?,?) ON CONFLICT(project_key) DO UPDATE SET project=excluded.project,classification=excluded.classification,updated_at=excluded.updated_at").bind(projectKey, normalizeProject(project), classification, now));
+      if (projectKey.includes("indiranagar")) {
+        const alias = projectKey.replace("indiranagar", "indranagar");
+        map.set(alias, classification);
+        statements.push(env.DB.prepare("INSERT INTO project_classifications(project_key,project,classification,updated_at) VALUES(?,?,?,?) ON CONFLICT(project_key) DO UPDATE SET project=excluded.project,classification=excluded.classification,updated_at=excluded.updated_at").bind(alias, normalizeProject(project).replace("Indiranagar", "Indranagar"), classification, now));
+      }
+    }
+  }
+  await env.DB.prepare("DELETE FROM project_classifications").run();
+  for (let i = 0; i < statements.length; i += 100) await env.DB.batch(statements.slice(i, i + 100));
+  return map;
+}
+
+async function backfillClassifications(env: Env) {
+  await env.DB.prepare("UPDATE expenses SET classification=COALESCE((SELECT classification FROM project_classifications pc WHERE pc.project_key=lower(replace(replace(expenses.project,'–','-'),'—','-'))),'Unclassified')").run();
 }
 
 function parseRow(source: keyof typeof tabs, row: string[], rowNo: number) {
@@ -63,7 +96,7 @@ function parseRow(source: keyof typeof tabs, row: string[], rowNo: number) {
   const monthKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
   return {
     id: `${source}:${rowNo}`,
-    project: source === "Payrolls" ? "Payroll" : clean(row[cfg.project]) || "Unassigned",
+    project: normalizeProject(source === "Payrolls" ? "Payroll" : clean(row[cfg.project]) || "Unassigned"),
     monthKey,
     monthLabel: d.toLocaleString("en-US", { month: "short", year: "numeric", timeZone: "UTC" }).replace(" ", "-"),
     date,
@@ -87,17 +120,27 @@ function normalizeDate(v?: string) {
 }
 
 const clean = (v?: string) => String(v || "").trim();
+const normalizeProject = (v: string) => clean(v).replace(/[–—]/g, "-").replace(/\s+/g, " ");
+const key = (v: string) => normalizeProject(v).toLowerCase();
 const json = (data: unknown) => new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } });
 
-async function projects(env: Env) {
-  const rows = await env.DB.prepare("SELECT project, ROUND(SUM(amount),2) total FROM expenses GROUP BY project ORDER BY project").all();
+async function classifications(env: Env) {
+  const rows = await env.DB.prepare("SELECT classification, ROUND(SUM(amount),2) total FROM expenses GROUP BY classification ORDER BY classification").all();
   return rows.results;
 }
 
-async function summary(env: Env, project: string) {
-  const rows = await env.DB.prepare("SELECT month_key monthKey, month_label month, ROUND(SUM(amount),2) total FROM expenses WHERE project=? GROUP BY month_key, month_label ORDER BY month_key").bind(project).all();
-  const total = await env.DB.prepare("SELECT ROUND(SUM(amount),2) total, COUNT(*) rows FROM expenses WHERE project=?").bind(project).first();
-  return { project, total, months: rows.results };
+async function projects(env: Env, classification: string) {
+  const rows = await env.DB.prepare("SELECT project, ROUND(SUM(amount),2) total FROM expenses WHERE classification=? GROUP BY project ORDER BY project").bind(classification).all();
+  return rows.results;
+}
+
+async function summary(env: Env, classification: string, project: string) {
+  const all = !project || project === "__all";
+  const where = all ? "classification=?" : "classification=? AND project=?";
+  const bind = all ? [classification] : [classification, project];
+  const rows = await env.DB.prepare(`SELECT month_key monthKey, month_label month, ROUND(SUM(amount),2) total FROM expenses WHERE ${where} GROUP BY month_key, month_label ORDER BY month_key`).bind(...bind).all();
+  const total = await env.DB.prepare(`SELECT ROUND(SUM(amount),2) total, COUNT(*) rows FROM expenses WHERE ${where}`).bind(...bind).first();
+  return { classification, project: all ? "All projects" : project, total, months: rows.results };
 }
 
 async function status(env: Env) {
