@@ -133,17 +133,21 @@ async function classifications(env: Env) {
 }
 
 async function projects(env: Env, classification: string) {
-  const rows = await env.DB.prepare("SELECT project, ROUND(SUM(amount),2) total FROM expenses WHERE classification=? GROUP BY project ORDER BY project").bind(classification).all();
+  const all = classification === "__all";
+  const rows = all
+    ? await env.DB.prepare("SELECT project, ROUND(SUM(amount),2) total FROM expenses GROUP BY project ORDER BY project").all()
+    : await env.DB.prepare("SELECT project, ROUND(SUM(amount),2) total FROM expenses WHERE classification=? GROUP BY project ORDER BY project").bind(classification).all();
   return rows.results;
 }
 
 async function summary(env: Env, classification: string, project: string) {
-  const all = !project || project === "__all";
-  const where = all ? "classification=?" : "classification=? AND project=?";
-  const bind = all ? [classification] : [classification, project];
+  const allClass = classification === "__all";
+  const allProject = !project || project === "__all";
+  const where = allClass ? (allProject ? "1=1" : "project=?") : (allProject ? "classification=?" : "classification=? AND project=?");
+  const bind = allClass ? (allProject ? [] : [project]) : (allProject ? [classification] : [classification, project]);
   const rows = await env.DB.prepare(`SELECT month_key monthKey, month_label month, ROUND(SUM(amount),2) total FROM expenses WHERE ${where} GROUP BY month_key, month_label ORDER BY month_key`).bind(...bind).all();
   const total = await env.DB.prepare(`SELECT ROUND(SUM(amount),2) total, COUNT(*) rows FROM expenses WHERE ${where}`).bind(...bind).first();
-  return { classification, project: all ? "All projects" : project, total, months: rows.results };
+  return { classification: allClass ? "All categories" : classification, project: allProject ? "All projects" : project, total, months: rows.results };
 }
 
 async function status(env: Env) {

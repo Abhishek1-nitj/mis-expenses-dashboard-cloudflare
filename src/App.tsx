@@ -19,7 +19,7 @@ function App() {
   async function load() {
     const cs = await fetch("/api/classifications").then((r) => r.json()) as Classification[];
     setClasses(cs);
-    const activeClass = classification || cs[0]?.classification || "";
+    const activeClass = classification || "__all";
     if (!classification) setClassification(activeClass);
     if (!activeClass) return;
     const ps = await fetch(`/api/projects?classification=${encodeURIComponent(activeClass)}`).then((r) => r.json()) as Project[];
@@ -65,6 +65,7 @@ function App() {
     <section className="controls">
       <label>Classification</label>
       <select value={classification} onChange={(e) => { setClassification(e.target.value); setProject("__all"); }}>
+        <option value="__all">All categories</option>
         {classes.map((c) => <option key={c.classification}>{c.classification}</option>)}
       </select>
       <label>Project</label>
