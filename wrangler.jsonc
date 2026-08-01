@@ -10,8 +10,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "expense-manager2",
-      "database_id": "23836278-3ac6-4ea7-ac61-422ee027d83f"
+      "database_name": "REPLACE_WITH_D1_DATABASE_NAME",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
     }
   ],
   "vars": {
