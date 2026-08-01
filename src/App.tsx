@@ -39,6 +39,7 @@ function App() {
 
   const peak = useMemo(() => months.reduce<Month | null>((m, r) => !m || r.total > m.total ? r : m, null), [months]);
   const avg = useMemo(() => months.length ? months.reduce((s, r) => s + r.total, 0) / months.length : 0, [months]);
+  const maxMonth = useMemo(() => months.reduce((m, r) => Math.max(m, r.total), 0), [months]);
   const median = useMemo(() => {
     if (!months.length) return 0;
     const sorted = months.map((m) => m.total).sort((a, b) => a - b);
@@ -99,7 +100,10 @@ function App() {
 
     <section className="table">
       <div className="thead"><span>Month</span><span>Total expense</span></div>
-      {months.map((m) => <div className="row" key={m.monthKey}><span>{m.month}</span><strong>{money(m.total)}</strong></div>)}
+      {months.map((m) => <div className="row" key={m.monthKey}>
+        <div className="bar" style={{ width: `${maxMonth ? Math.max(6, (m.total / maxMonth) * 100) : 0}%` }} />
+        <span>{m.month}</span><strong>{money(m.total)}</strong>
+      </div>)}
     </section>
   </main>;
 }
