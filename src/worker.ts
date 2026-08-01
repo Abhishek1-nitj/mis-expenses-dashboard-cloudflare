@@ -15,7 +15,10 @@ export default {
     if (url.pathname === "/api/projects") return json(await projects(env, url.searchParams.get("classification") || ""));
     if (url.pathname === "/api/summary") return json(await summary(env, url.searchParams.get("classification") || "", url.searchParams.get("project") || ""));
     if (url.pathname === "/api/status") return json(await status(env));
-    return env.ASSETS.fetch(req);
+    const res = await env.ASSETS.fetch(req);
+    const headers = new Headers(res.headers);
+    headers.set("cache-control", "no-store, max-age=0");
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
   },
 };
 
