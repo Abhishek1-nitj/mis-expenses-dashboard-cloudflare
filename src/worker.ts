@@ -160,7 +160,25 @@ async function summary(env: Env, classification: string, project: string, date: 
   const bind = [...(allClass ? (allProject ? [] : [project]) : (allProject ? [classification] : [classification, project])), ...date.bind];
   const rows = await env.DB.prepare(`SELECT month_key monthKey, month_label month, ROUND(SUM(amount),2) total FROM expenses WHERE ${where} GROUP BY month_key, month_label ORDER BY month_key DESC`).bind(...bind).all();
   const total = await env.DB.prepare(`SELECT ROUND(SUM(amount),2) total, COUNT(*) rows FROM expenses WHERE ${where}`).bind(...bind).first();
-  return { classification: allClass ? "All categories" : classification, project: allProject ? "All projects" : project, total, months: rows.results };
+  const overall = await env.DB.prepare(`SELECT ROUND(SUM(amount),2) total FROM expenses WHERE ${date.sql}`).bind(...date.bind).first() as { total: number | null } | null;
+  const classTotal = allClass ? null : await env.DB.prepare(`SELECT ROUND(SUM(amount),2) total FROM expenses WHERE classification=? AND ${date.sql}`).bind(classification, ...date.bind).first() as { total: number | null } | null;
+  const projectInClass = allClass || allProject ? null : total as { total: number | null };
+  const projectOverall = allProject ? null : await env.DB.prepare(`SELECT ROUND(SUM(amount),2) total FROM expenses WHERE project=? AND ${date.sql}`).bind(project, ...date.bind).first() as { total: number | null } | null;
+  return {
+    classification: allClass ? "All categories" : classification,
+    project: allProject ? "All projects" : project,
+    total,
+    months: rows.results,
+    percentages: {
+      classificationOfAll: pct(classTotal?.total, overall?.total),
+      projectOfClassification: pct(projectInClass?.total, classTotal?.total),
+      projectOfAll: pct(projectOverall?.total, overall?.total),
+    },
+  };
+}
+
+function pct(part?: number | null, whole?: number | null) {
+  return part == null || !whole ? null : (part / whole) * 100;
 }
 
 async function status(env: Env) {

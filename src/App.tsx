@@ -1,11 +1,17 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { RefreshCw, WalletCards } from "lucide-react";
+import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
+import WalletCards from "lucide-react/dist/esm/icons/wallet-cards.mjs";
 import "./style.css";
 
 type Classification = { classification: string; total: number };
 type Project = { project: string; total: number };
 type Month = { monthKey: string; month: string; total: number };
+type Percentages = {
+  classificationOfAll: number | null;
+  projectOfClassification: number | null;
+  projectOfAll: number | null;
+};
 
 function App() {
   const [classes, setClasses] = useState<Classification[]>([]);
@@ -17,6 +23,7 @@ function App() {
   const [end, setEnd] = useState(new Date().toISOString().slice(0, 10));
   const [months, setMonths] = useState<Month[]>([]);
   const [total, setTotal] = useState<{ total: number; rows: number }>({ total: 0, rows: 0 });
+  const [percentages, setPercentages] = useState<Percentages>({ classificationOfAll: null, projectOfClassification: null, projectOfAll: null });
   const [syncing, setSyncing] = useState(false);
 
   async function load() {
@@ -32,6 +39,7 @@ function App() {
     const s = await fetch(`/api/summary?${dateQs(activeClass, activeProject, date, start, end)}`).then((r) => r.json());
     setMonths(s.months);
     setTotal(s.total || { total: 0, rows: 0 });
+    setPercentages(s.percentages || { classificationOfAll: null, projectOfClassification: null, projectOfAll: null });
   }
 
   useEffect(() => { load(); }, []);
@@ -94,6 +102,11 @@ function App() {
       <article><WalletCards/><span>Total expense</span><strong>{money(total.total || 0)}</strong></article>
       <article><span>Avg expense per month</span><strong>{money(avg)}</strong></article>
       <article><span>Peak month</span><strong>{peak ? peak.month : "-"}</strong><em>{money(peak?.total || 0)}</em></article>
+      {classification !== "__all" && <article><span>Classification share</span><strong>{percent(percentages.classificationOfAll)}</strong></article>}
+      {classification !== "__all" && project !== "__all" && <>
+        <article><span>Project share in classification</span><strong>{percent(percentages.projectOfClassification)}</strong></article>
+        <article><span>Project share of total</span><strong>{percent(percentages.projectOfAll)}</strong></article>
+      </>}
     </section>
 
     <section className="table">
@@ -117,6 +130,10 @@ function money(n: number) {
 
 function trim(n: number) {
   return n.toFixed(n >= 10 ? 1 : 2).replace(/\.0$|0$/g, "");
+}
+
+function percent(n: number | null) {
+  return n == null ? "-" : `${trim(n)}%`;
 }
 
 function dateQs(classification: string, project: string, date: string, start: string, end: string) {
