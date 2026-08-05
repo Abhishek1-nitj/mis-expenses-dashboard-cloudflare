@@ -27,18 +27,15 @@ async function sync(env: Env) {
   const now = new Date().toISOString();
   const classMap = await syncClassifications(env, token, now);
   let processed = 0;
-  let hasMore = false;
-  const limit = 700;
+  await env.DB.prepare("DELETE FROM expenses").run();
   for (const [sheet, cfg] of Object.entries(tabs)) {
-    const state = await env.DB.prepare("SELECT last_row FROM sync_state WHERE sheet_name=?").bind(sheet).first() as { last_row: number } | null;
-    const start = Math.max(2, (state?.last_row ?? 1) + 1);
     const range = `'${sheet.replaceAll("'", "''")}'!${cfg.rangeCols}`;
     const rows = await sheetValues(env.SPREADSHEET_ID, range, token);
-    const newRows = rows.slice(start - 1, start - 1 + limit);
+    const newRows = rows.slice(1);
     const statements = [];
-    let lastRow = start - 1;
+    let lastRow = 1;
     for (let i = 0; i < newRows.length; i++) {
-      const rowNo = start + i;
+      const rowNo = i + 2;
       const row = newRows[i];
       if (!row?.some(Boolean)) continue;
       const parsed = parseRow(sheet as keyof typeof tabs, row, rowNo);
@@ -50,14 +47,11 @@ async function sync(env: Env) {
       processed++;
     }
     for (let i = 0; i < statements.length; i += 100) await env.DB.batch(statements.slice(i, i + 100));
-    if (lastRow >= start) {
-      await env.DB.prepare("INSERT INTO sync_state(sheet_name,last_row,updated_at) VALUES(?,?,?) ON CONFLICT(sheet_name) DO UPDATE SET last_row=excluded.last_row,updated_at=excluded.updated_at")
-        .bind(sheet, lastRow, now).run();
-    }
-    if (rows.length > lastRow) hasMore = true;
+    await env.DB.prepare("INSERT INTO sync_state(sheet_name,last_row,updated_at) VALUES(?,?,?) ON CONFLICT(sheet_name) DO UPDATE SET last_row=excluded.last_row,updated_at=excluded.updated_at")
+      .bind(sheet, lastRow, now).run();
   }
   await backfillClassifications(env);
-  return { processed, hasMore, classifications: classMap.size, syncedAt: now };
+  return { processed, hasMore: false, classifications: classMap.size, syncedAt: now };
 }
 
 async function syncClassifications(env: Env, token: string, now: string) {
