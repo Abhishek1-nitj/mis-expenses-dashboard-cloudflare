@@ -108,6 +108,8 @@ function normalizeDate(v?: string) {
   const s = String(v).trim();
   const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const numeric = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (numeric) return `${Number(numeric[3].length === 2 ? "20" + numeric[3] : numeric[3])}-${String(Number(numeric[1])).padStart(2, "0")}-${String(Number(numeric[2])).padStart(2, "0")}`;
   const m = s.match(/^(\d{1,2})[-/ ]([A-Za-z]{3,})[-/ ](\d{2,4})$/);
   if (!m) return "";
   const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
