@@ -3,7 +3,7 @@ import type { Env } from "./env";
 const tabs = {
   Claims: { rangeCols: "A:X", date: 1, project: 6, amount: 8, merchant: 7, category: 22 },
   Expenses: { rangeCols: "A:V", date: 9, project: 2, amount: 6, merchant: 4, category: 19 },
-  "Purchase Bills": { rangeCols: "A:Y", date: 8, project: 2, amount: 11, merchant: 4, category: 22 },
+  "Purchase Bills": { rangeCols: "A:Y", date: 6, project: 2, amount: 11, merchant: 4, category: 22 },
   Payrolls: { rangeCols: "A:N", date: 4, project: -1, amount: 5, merchant: 1, category: 11 },
 } as const;
 
