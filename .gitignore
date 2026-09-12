@@ -2,5 +2,30 @@ node_modules/
 dist/
 .wrangler/
 .dev.vars
+.env*
+*.service-account.json
 Google Sheet jason/
+sync_cache/
 .DS_Store
+*.docx
+*.xlsx
+*.csv
+backups/
+docx_render*/
+google-apps-script/
+Devotee\ Forms/
+CF\ API\ Token*
+*.log
+*.txt
+*.mjs
+*.py
+*.html
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!wrangler.jsonc
+!sync_engine/**
+
+
+
