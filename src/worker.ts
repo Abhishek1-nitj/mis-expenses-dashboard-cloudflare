@@ -13,7 +13,17 @@ const sheetSequence: TabKey[] = ["Purchase Bills", "Expenses", "Claims", "Payrol
 export default {
   async fetch(req: Request, env: Env) {
     const url = new URL(req.url);
-    if (url.pathname === "/api/sync" && req.method === "POST") return json(await syncStep(env, url));
+    if (url.pathname === "/api/sync" && req.method === "POST") {
+      try {
+        return json(await syncStep(env, url));
+      } catch (err: any) {
+        console.error("Sync step error:", err);
+        return new Response(JSON.stringify({ error: err?.message || String(err), stack: err?.stack, step: url.searchParams.get("step"), offset: url.searchParams.get("offset") }), {
+          status: 500,
+          headers: { "content-type": "application/json" }
+        });
+      }
+    }
     if (url.pathname === "/api/classifications") return json(await classifications(env));
     if (url.pathname === "/api/projects") return json(await projects(env, url.searchParams.get("classification") || "", dateWhere(url)));
     if (url.pathname === "/api/summary") return json(await summary(env, url.searchParams.get("classification") || "", url.searchParams.get("project") || "", dateWhere(url)));
@@ -25,11 +35,12 @@ export default {
   },
 };
 
+
 async function syncStep(env: Env, url: URL) {
   const step = Number(url.searchParams.get("step") ?? "0");
   const offset = Number(url.searchParams.get("offset") ?? "0");
   const mode = url.searchParams.get("mode") ?? "delta";
-  const chunkSize = 1500;
+  const chunkSize = 1000;
   const token = await accessToken(env);
   const now = new Date().toISOString();
 
@@ -82,13 +93,17 @@ async function syncStep(env: Env, url: URL) {
     classMap.set(r.project_key, r.classification);
   }
 
-  // If starting a sheet from offset 0, clean up any previous records for this source
-  if (offset === 0) {
+  // If in delta mode, only fetch the latest 250 rows per sheet (avoids full wipe and saves write quota)
+  const isDelta = mode === "delta";
+  const actualChunkSize = isDelta ? 250 : chunkSize;
+
+  // If starting a sheet from offset 0 in full mode, clean up previous records
+  if (offset === 0 && !isDelta) {
     await env.DB.prepare("DELETE FROM expenses WHERE source = ?").bind(sheetName).run();
   }
 
   const startRow = offset + 1;
-  const endRow = offset + chunkSize;
+  const endRow = offset + actualChunkSize;
   const range = `'${sheetName.replaceAll("'", "''")}'!A${startRow}:Z${endRow}`;
   const rows = await sheetValues(env.SPREADSHEET_ID, range, token);
 
@@ -129,23 +144,25 @@ async function syncStep(env: Env, url: URL) {
     );
   }
 
-  // Execute inserts in batches of 100 statements
-  for (let i = 0; i < statements.length; i += 100) {
-    await env.DB.batch(statements.slice(i, i + 100));
+  // Execute inserts in batches of 50 statements
+  for (let i = 0; i < statements.length; i += 50) {
+    await env.DB.batch(statements.slice(i, i + 50));
   }
 
-  const isSheetDone = rows.length < chunkSize;
+  // In delta mode, 1 chunk of 250 rows per sheet is sufficient
+  const isSheetDone = isDelta || rows.length < actualChunkSize;
   const nextStep = isSheetDone ? step + 1 : step;
-  const nextOffset = isSheetDone ? 0 : offset + chunkSize;
+  const nextOffset = isSheetDone ? 0 : offset + actualChunkSize;
 
   // Progress calculation
-  const totalStepsEst = 10;
-  const currentUnit = (step - 1) * 2 + (offset > 0 ? 1 : 0);
+  const totalStepsEst = isDelta ? 5 : 10;
+  const currentUnit = isDelta ? step : (step - 1) * 2 + (offset > 0 ? 1 : 0);
   const progress = Math.min(95, Math.round(10 + (currentUnit / totalStepsEst) * 85));
 
   const msg = isSheetDone
-    ? `Finished ${sheetName}.`
+    ? `Updated recent ${sheetName}.`
     : `Syncing ${sheetName} (rows ${startRow} - ${endRow})...`;
+
 
   return {
     hasMore: true,
