@@ -2,7 +2,8 @@
 
 A production Cloudflare Workers + D1 + React dashboard for real-time tracking, categorization, and analysis of ISKCON Whitefield expenses across all projects, classifications, and vendors.
 
-Live URL: [https://mis-expenses-dashboard.zoom-attendance-live.workers.dev/](https://mis-expenses-dashboard.zoom-attendance-live.workers.dev/)
+Live URL: [https://mis-expenses-dashboard.abhishek-nitj-002-1.workers.dev/](https://mis-expenses-dashboard.abhishek-nitj-002-1.workers.dev/)
+
 
 ---
 
