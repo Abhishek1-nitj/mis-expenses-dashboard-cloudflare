@@ -1,9 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+// @ts-ignore
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw.mjs";
+// @ts-ignore
 import WalletCards from "lucide-react/dist/esm/icons/wallet-cards.mjs";
+// @ts-ignore
 import ChevronDown from "lucide-react/dist/esm/icons/chevron-down.mjs";
+// @ts-ignore
 import X from "lucide-react/dist/esm/icons/x.mjs";
+// @ts-ignore
 import Check from "lucide-react/dist/esm/icons/check.mjs";
 import "./style.css";
 
@@ -271,35 +276,44 @@ function App() {
   async function sync() {
     if (syncing) return;
     setSyncing(true);
-    setSyncStatus("Starting sync...");
+    setSyncStatus("Connecting to cloud sync...");
     try {
       let currentStep = 0;
       let currentOffset = 0;
       for (;;) {
-        const url = `/api/sync?step=${currentStep}&offset=${currentOffset}`;
+        const url = `/api/sync?step=${currentStep}&offset=${currentOffset}&mode=delta`;
         const res = await fetch(url, { method: "POST" });
         if (!res.ok) {
           const errText = await res.text();
-          throw new Error(`Sync step failed (${res.status}): ${errText}`);
+          let cleanMsg = `Sync step failed (${res.status})`;
+          if (errText.includes("Worker exceeded resource limits")) {
+            cleanMsg = "Sync hit edge CPU limit. Please tap sync once more.";
+          } else if (errText.includes("exceeded D1's free tier")) {
+            cleanMsg = "Daily Cloudflare write quota reached. Existing records remain live.";
+          } else if (!errText.startsWith("<")) {
+            cleanMsg += `: ${errText.slice(0, 100)}`;
+          }
+          throw new Error(cleanMsg);
         }
         const data = await res.json();
-        setSyncStatus(data.message || `Syncing ${data.stepName || ""}...`);
+        const pctStr = data.progress ? ` (${data.progress}%)` : "";
+        setSyncStatus((data.message || `Syncing ${data.stepName || ""}...`) + pctStr);
         if (data.done || !data.hasMore) {
-          setSyncStatus("Sync completed!");
+          setSyncStatus(`Sync complete! ${data.totals?.rows ?? ""} records active.`);
           break;
         }
         currentStep = data.nextStep;
         currentOffset = data.offset ?? 0;
       }
-      await load();
     } catch (err: any) {
       console.error("Sync error:", err);
-      setSyncStatus(`Sync error: ${err?.message || "Failed"}`);
+      setSyncStatus(err?.message || "Sync paused");
     } finally {
+      await load();
       setTimeout(() => {
         setSyncing(false);
         setSyncStatus("");
-      }, 2000);
+      }, 4000);
     }
   }
 

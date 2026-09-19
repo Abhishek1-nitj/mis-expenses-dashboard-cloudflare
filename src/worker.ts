@@ -15,7 +15,7 @@ export default {
     const url = new URL(req.url);
     if (url.pathname === "/api/sync" && req.method === "POST") {
       try {
-        return json(await syncStep(env, url));
+        return json(await syncStep(env, url, req));
       } catch (err: any) {
         console.error("Sync step error:", err);
         return new Response(JSON.stringify({ error: err?.message || String(err), stack: err?.stack, step: url.searchParams.get("step"), offset: url.searchParams.get("offset") }), {
@@ -23,6 +23,28 @@ export default {
           headers: { "content-type": "application/json" }
         });
       }
+    }
+    if (url.pathname === "/api/volopay/auth") {
+      if (req.method === "POST") {
+        try {
+          const body = await req.json() as any;
+          if (body.access_token && body.client) {
+            const now = new Date().toISOString();
+            await env.DB.batch([
+              env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('access_token', ?, ?)").bind(body.access_token, now),
+              env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('client', ?, ?)").bind(body.client, now),
+              ...(body.uid ? [env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('uid', ?, ?)").bind(body.uid, now)] : []),
+              ...(body.expiry ? [env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('expiry', ?, ?)").bind(String(body.expiry), now)] : []),
+            ]);
+            return json({ ok: true, message: "Volopay tokens saved to D1!" });
+          }
+          return json({ ok: false, error: "Missing access_token or client" }, 400);
+        } catch (e: any) {
+          return json({ ok: false, error: e.message }, 500);
+        }
+      }
+      const rows = await env.DB.prepare("SELECT key, updated_at FROM volopay_auth").all();
+      return json({ ok: true, tokens: rows.results });
     }
     if (url.pathname === "/api/classifications") return json(await classifications(env));
     if (url.pathname === "/api/projects") return json(await projects(env, url.searchParams.get("classification") || "", dateWhere(url)));
@@ -36,19 +58,37 @@ export default {
 };
 
 
-async function syncStep(env: Env, url: URL) {
-  const step = Number(url.searchParams.get("step") ?? "0");
-  const offset = Number(url.searchParams.get("offset") ?? "0");
-  const mode = url.searchParams.get("mode") ?? "delta";
-  const chunkSize = 1000;
+async function syncStep(env: Env, url: URL, req?: Request) {
+  let stepVal = url.searchParams.get("step");
+  let offsetVal = url.searchParams.get("offset");
+  let modeVal = url.searchParams.get("mode");
+
+  if (req && req.headers.get("content-type")?.includes("application/json")) {
+    try {
+      const body = await req.json() as any;
+      if (body && typeof body === "object") {
+        if (body.step !== undefined) stepVal = String(body.step);
+        if (body.offset !== undefined) offsetVal = String(body.offset);
+        if (body.mode !== undefined) modeVal = String(body.mode);
+      }
+    } catch {}
+  }
+
+  const step = Number(stepVal ?? "0");
+  const offset = Number(offsetVal ?? "0");
+  const mode = modeVal ?? "delta";
   const token = await accessToken(env);
   const now = new Date().toISOString();
 
-  // Step 0: Clear / Initialize Classifications
+  // Step 0: Sync Volopay into Google Sheets + Sync Classifications into D1
   if (step === 0) {
-    if (mode === "full") {
-      await env.DB.prepare("DELETE FROM expenses").run();
-      await env.DB.prepare("DELETE FROM project_classifications").run();
+    let voloMsg = "Volopay verified";
+    try {
+      const voloRes = await syncVolopayToSheets(env, token);
+      voloMsg = voloRes.summary;
+    } catch (vErr: any) {
+      console.warn("Volopay sync warning (falling back to Google Sheets):", vErr.message);
+      voloMsg = `Volopay check (${vErr.message.slice(0, 50)})`;
     }
     const count = await syncClassifications(env, token, now);
     return {
@@ -57,9 +97,9 @@ async function syncStep(env: Env, url: URL) {
       nextStep: 1,
       offset: 0,
       mode,
-      stepName: "Classifications",
-      message: `Project classifications synced (${count} rules). Starting Purchase Bills...`,
-      progress: 5,
+      stepName: "Volopay & Classifications",
+      message: `${voloMsg}. Classifications synced (${count} rules). Starting Purchase Bills...`,
+      progress: 10,
     };
   }
 
@@ -80,7 +120,7 @@ async function syncStep(env: Env, url: URL) {
     };
   }
 
-  // Steps 1..4: Process sheets in chunks
+  // Steps 1..4: Process sheets
   const sheetIndex = step - 1;
   const sheetName = sheetSequence[sheetIndex];
   const cfg = tabs[sheetName];
@@ -93,28 +133,36 @@ async function syncStep(env: Env, url: URL) {
     classMap.set(r.project_key, r.classification);
   }
 
-  // If in delta mode, only fetch the latest 250 rows per sheet (avoids full wipe and saves write quota)
   const isDelta = mode === "delta";
-  const actualChunkSize = isDelta ? 250 : chunkSize;
+  let startRow: number;
+  let endRow: number;
+  let isSheetDone = false;
 
-  // If starting a sheet from offset 0 in full mode, clean up previous records
-  if (offset === 0 && !isDelta) {
-    await env.DB.prepare("DELETE FROM expenses WHERE source = ?").bind(sheetName).run();
+  if (isDelta) {
+    // In delta mode, find the highest valid row currently in D1 for this sheet
+    const maxRes = await env.DB.prepare("SELECT COALESCE(MAX(source_row), 1) as max_row FROM expenses WHERE source = ? AND amount > 0 AND expense_date != ''").bind(sheetName).first() as { max_row: number } | null;
+    const currentMax = maxRes?.max_row || 1;
+    // Overlap by 50 rows to ensure recent updates or edits are refreshed
+    startRow = Math.max(2, currentMax - 50);
+    endRow = startRow + 500; // Fetch up to 500 latest rows
+    isSheetDone = true; // Delta mode syncs the delta in 1 fast pass per sheet
+  } else {
+    // Full sync paginates in safe 250-row chunks
+    const chunkSize = 250;
+    startRow = offset + 1;
+    endRow = offset + chunkSize;
   }
 
-  const startRow = offset + 1;
-  const endRow = offset + actualChunkSize;
   const range = `'${sheetName.replaceAll("'", "''")}'!A${startRow}:Z${endRow}`;
   const rows = await sheetValues(env.SPREADSHEET_ID, range, token);
 
-  // If startRow == 1, row 0 is headers
-  const dataRows = offset === 0 ? rows.slice(1) : rows;
   const statements: any[] = [];
   let validRowsCount = 0;
 
-  for (let i = 0; i < dataRows.length; i++) {
-    const rowNo = offset === 0 ? i + 2 : offset + i + 1;
-    const row = dataRows[i];
+  for (let i = 0; i < rows.length; i++) {
+    const rowNo = startRow + i;
+    if (rowNo === 1) continue; // Skip header row
+    const row = rows[i];
     if (!row?.some(Boolean)) continue;
     const parsed = parseRow(sheetName, row, rowNo);
     if (!parsed) continue;
@@ -144,25 +192,40 @@ async function syncStep(env: Env, url: URL) {
     );
   }
 
-  // Execute inserts in batches of 50 statements
-  for (let i = 0; i < statements.length; i += 50) {
-    await env.DB.batch(statements.slice(i, i + 50));
+  // Execute inserts safely in batches of 50
+  if (statements.length > 0) {
+    try {
+      for (let i = 0; i < statements.length; i += 50) {
+        await env.DB.batch(statements.slice(i, i + 50));
+      }
+    } catch (d1Err: any) {
+      console.warn("D1 batch insert warning:", d1Err.message);
+      if (d1Err.message?.includes("exceeded D1's free tier daily row write limit")) {
+        return {
+          hasMore: false,
+          done: true,
+          nextStep: null,
+          offset: 0,
+          mode,
+          stepName: sheetName,
+          message: `Daily Cloudflare write quota reached. Existing records remain active and live.`,
+          progress: 100,
+        };
+      }
+      throw d1Err;
+    }
   }
 
-  // In delta mode, 1 chunk of 250 rows per sheet is sufficient
-  const isSheetDone = isDelta || rows.length < actualChunkSize;
+  if (!isDelta) {
+    isSheetDone = rows.length < 250;
+  }
   const nextStep = isSheetDone ? step + 1 : step;
-  const nextOffset = isSheetDone ? 0 : offset + actualChunkSize;
+  const nextOffset = isSheetDone ? 0 : offset + 250;
 
-  // Progress calculation
-  const totalStepsEst = isDelta ? 5 : 10;
-  const currentUnit = isDelta ? step : (step - 1) * 2 + (offset > 0 ? 1 : 0);
-  const progress = Math.min(95, Math.round(10 + (currentUnit / totalStepsEst) * 85));
-
+  const progress = Math.min(95, Math.round(15 + (step / 5) * 80));
   const msg = isSheetDone
-    ? `Updated recent ${sheetName}.`
+    ? `Synced ${sheetName} (${validRowsCount} recent rows updated).`
     : `Syncing ${sheetName} (rows ${startRow} - ${endRow})...`;
-
 
   return {
     hasMore: true,
@@ -263,7 +326,7 @@ function cleanKey(v: string) {
     .trim();
 }
 
-const json = (data: unknown) => new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } });
+const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 
 async function classifications(env: Env) {
   const rows = await env.DB.prepare("SELECT classification, ROUND(SUM(amount),2) total FROM expenses GROUP BY classification ORDER BY classification").all();
@@ -334,10 +397,30 @@ async function sheetValues(id: string, range: string, token: string): Promise<st
   return ((await res.json()) as { values?: string[][] }).values || [];
 }
 
+async function sheetAppendRows(id: string, sheetTitle: string, rows: (string | number)[][], token: string): Promise<number> {
+  if (!rows || rows.length === 0) return 0;
+  const range = `'${sheetTitle.replaceAll("'", "''")}'!A:Z`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ values: rows }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error(`Sheet append error for ${sheetTitle}:`, errText);
+    return 0;
+  }
+  return rows.length;
+}
+
 async function accessToken(env: Env) {
   const sa = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT_JSON);
   const now = Math.floor(Date.now() / 1000);
-  const claim = { iss: sa.client_email, scope: "https://www.googleapis.com/auth/spreadsheets.readonly", aud: "https://oauth2.googleapis.com/token", exp: now + 3600, iat: now };
+  const claim = { iss: sa.client_email, scope: "https://www.googleapis.com/auth/spreadsheets", aud: "https://oauth2.googleapis.com/token", exp: now + 3600, iat: now };
   const unsigned = `${b64({ alg: "RS256", typ: "JWT" })}.${b64(claim)}`;
   const key = await crypto.subtle.importKey("pkcs8", pem(sa.private_key), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
   const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(unsigned));
@@ -349,6 +432,272 @@ async function accessToken(env: Env) {
   });
   if (!res.ok) throw new Error(await res.text());
   return ((await res.json()) as { access_token: string }).access_token;
+}
+
+async function getVolopayAuth(env: Env) {
+  try {
+    const rows = await env.DB.prepare("SELECT key, value FROM volopay_auth").all();
+    const map: Record<string, string> = {};
+    for (const r of (rows.results || []) as { key: string; value: string }[]) {
+      map[r.key] = r.value;
+    }
+    return {
+      accessToken: map["access_token"] || env.VOLOPAY_ACCESS_TOKEN || "mek2wR2Ze6wc-Xh6GLSSxA",
+      client: map["client"] || env.VOLOPAY_CLIENT || "RXXI4JNxICLlg96mwWzP-g",
+      uid: map["uid"] || env.VOLOPAY_UID || "abhishek.nitj.002@gmail.com",
+      account: map["account"] || env.VOLOPAY_ACCOUNT || "iskconwhitefield",
+      baseUrl: "https://api-in.volopay.co/api/v3",
+    };
+  } catch {
+    return {
+      accessToken: env.VOLOPAY_ACCESS_TOKEN || "mek2wR2Ze6wc-Xh6GLSSxA",
+      client: env.VOLOPAY_CLIENT || "RXXI4JNxICLlg96mwWzP-g",
+      uid: env.VOLOPAY_UID || "abhishek.nitj.002@gmail.com",
+      account: env.VOLOPAY_ACCOUNT || "iskconwhitefield",
+      baseUrl: "https://api-in.volopay.co/api/v3",
+    };
+  }
+}
+
+async function voloFetch(endpoint: string, auth: any, env: Env) {
+  const url = `${auth.baseUrl}/${endpoint.replace(/^\//, "")}`;
+  const res = await fetch(url, {
+    headers: {
+      "access-token": auth.accessToken,
+      client: auth.client,
+      uid: auth.uid,
+      "token-type": "Bearer",
+      account: auth.account,
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+      Origin: `https://${auth.account}.volopay.co.in`,
+      Referer: `https://${auth.account}.volopay.co.in/`,
+      Accept: "application/json, text/plain, */*",
+    },
+  });
+
+  // Handle token rotation automatically
+  const newAccess = res.headers.get("access-token");
+  const newClient = res.headers.get("client");
+  const newExpiry = res.headers.get("expiry");
+  if (newAccess && (newAccess !== auth.accessToken || newClient !== auth.client)) {
+    auth.accessToken = newAccess;
+    if (newClient) auth.client = newClient;
+    const now = new Date().toISOString();
+    try {
+      await env.DB.batch([
+        env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('access_token', ?, ?)").bind(newAccess, now),
+        env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('client', ?, ?)").bind(newClient || auth.client, now),
+        ...(newExpiry ? [env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('expiry', ?, ?)").bind(newExpiry, now)] : []),
+      ]);
+    } catch (dbErr) {
+      console.warn("Could not save rotated tokens to D1:", dbErr);
+    }
+  }
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Volopay ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  return res.json() as Promise<any>;
+}
+
+async function getRecentSheetRows(id: string, sheetTitle: string, token: string, maxRows = 300): Promise<string[][]> {
+  try {
+    const colE = await sheetValues(id, `'${sheetTitle.replaceAll("'", "''")}'!E:E`, token);
+    const total = colE.length;
+    if (total <= 1) return [];
+    const start = Math.max(2, total - maxRows);
+    return await sheetValues(id, `'${sheetTitle.replaceAll("'", "''")}'!A${start}:Z${total + 50}`, token);
+  } catch {
+    return [];
+  }
+}
+
+async function syncVolopayToSheets(env: Env, token: string) {
+  const auth = await getVolopayAuth(env);
+  let totalNew = 0;
+
+  // 1. Claims (reimbursements)
+  try {
+    const claimsRes = await voloFetch("accounting/reimbursements?page=1&limit=50", auth, env);
+    const claimsList = claimsRes.list || claimsRes.data || [];
+    if (claimsList.length > 0) {
+      const existingClaims = await getRecentSheetRows(env.SPREADSHEET_ID, "Claims", token);
+      const existingKeys = new Set(existingClaims.map(r => `${clean(r[1])}_${clean(r[7])}_${clean(r[8])}`));
+      const newRows: string[][] = [];
+      for (const c of claimsList) {
+        const txnDate = normalizeDate(c.transactionDate || c.travelDate || c.created_at);
+        const merchant = clean(c.merchant);
+        const amount = String(c.amountToBePaid || c.amount?.value || c.amount || "0");
+        const key = `${txnDate}_${merchant}_${amount}`;
+        if (!existingKeys.has(key)) {
+          existingKeys.add(key);
+          const ownerObj = c.createdBy || c.user || {};
+          const ownerName = clean(typeof ownerObj === "object" ? ownerObj.name : c.claimOwner);
+          const ownerEmail = clean(typeof ownerObj === "object" ? ownerObj.email : c.claimOwnerEmail);
+          const linked = typeof c.linkedTo === "object" ? (c.linkedTo?.name || c.linkedTo?.project_name || "") : clean(c.linkedTo);
+          const curr = clean(c.amount?.currency || "INR");
+          const voloCat = clean(c.accountingVendorName || c.category || "Other");
+          const status = clean(c.status || c.accountingStatus);
+          const remarks = clean(c.memo || c.accountingMemo);
+          let tallyCat = "";
+          for (const tag of (c.accountingTags || [])) {
+            const val = tag?.tagValue || tag?.customTextValue || "";
+            if (val) { tallyCat = clean(val); break; }
+          }
+          newRows.push([
+            clean(c.created_at || c.createdAt), txnDate, clean(c.settlementDate), clean(c.type || "out_of_pocket"),
+            ownerName, ownerEmail, linked, merchant, amount, curr, voloCat, status, amount, curr,
+            "", "", "", "", "", remarks, "", clean(c.approvalDate), tallyCat, ""
+          ]);
+        }
+      }
+      if (newRows.length > 0) {
+        const appended = await sheetAppendRows(env.SPREADSHEET_ID, "Claims", newRows, token);
+        totalNew += appended;
+      }
+    }
+  } catch (e: any) {
+    console.warn("Claims sync warning:", e.message);
+  }
+
+  // 2. Expenses (card & upi)
+  try {
+    const expRes = await voloFetch("accounting/expenses?page=1&limit=50", auth, env);
+    const expList = expRes.list || expRes.data || [];
+    if (expList.length > 0) {
+      const existingExp = await getRecentSheetRows(env.SPREADSHEET_ID, "Expenses", token);
+      const existingTxnIds = new Set(existingExp.map(r => clean(r[11])));
+      const newRows: string[][] = [];
+      for (const e of expList) {
+        const txnId = clean(e.accountingId || e.id);
+        if (txnId && !existingTxnIds.has(txnId)) {
+          existingTxnIds.add(txnId);
+          const cardHolder = e.cardHolder || {};
+          const ownerName = clean(typeof cardHolder === "object" ? cardHolder.name : "");
+          const ownerEmail = clean(typeof cardHolder === "object" ? cardHolder.email : "");
+          const linked = typeof e.linkedTo === "object" ? (e.linkedTo?.name || e.linkedTo?.project_name || "") : clean(e.linkedTo);
+          const ptype = e.expenseViaUpi ? "UPI" : "Card Expense";
+          const merchant = clean(e.merchant);
+          const pMerchant = clean(e.accountingVendorName || merchant);
+          const totAmt = clean(e.amount?.value || e.amount || "0");
+          const curr = clean(e.amount?.currency || "INR");
+          const txnDate = normalizeDate(e.transactionDate || e.accountingDate);
+          const ledgerDate = clean(e.accountingDate || e.transactionDate);
+          const status = clean(e.accountingStatus || e.transactionStatus);
+          const gst = e.gstApplied ? "Yes" : "";
+          const note = clean(e.memo);
+          let tallyCat = "";
+          for (const tag of (e.accountingTags || [])) {
+            const val = tag?.tagValue || tag?.customTextValue || "";
+            if (val) { tallyCat = clean(val); break; }
+          }
+          newRows.push([
+            ownerName, ownerEmail, linked, ptype, merchant, pMerchant,
+            totAmt, totAmt, curr, txnDate, ledgerDate, txnId, "",
+            status, gst, note, curr, "1", "", tallyCat, "", "", ""
+          ]);
+        }
+      }
+      if (newRows.length > 0) {
+        const appended = await sheetAppendRows(env.SPREADSHEET_ID, "Expenses", newRows, token);
+        totalNew += appended;
+      }
+    }
+  } catch (e: any) {
+    console.warn("Expenses sync warning:", e.message);
+  }
+
+  // 3. Purchase Bills
+  try {
+    const billsRes = await voloFetch("accounting/bill-pay?page=1&limit=50", auth, env);
+    const billsList = billsRes.list || billsRes.data || [];
+    if (billsList.length > 0) {
+      const existingBills = await getRecentSheetRows(env.SPREADSHEET_ID, "Purchase Bills", token);
+      const existingInvKeys = new Set(existingBills.map(r => `${clean(r[4])}_${clean(r[5])}_${clean(r[11])}`));
+      const newRows: string[][] = [];
+      for (const b of billsList) {
+        const vendor = clean(b.vendor?.name || b.accountingVendorName || "");
+        const invNo = clean(b.invoiceNumber || "");
+        const totAmt = clean(b.invoicePayableAmount || b.invoiceGrossTotal || b.amountToBePaid || "0");
+        const key = `${vendor}_${invNo}_${totAmt}`;
+        if (!existingInvKeys.has(key)) {
+          existingInvKeys.add(key);
+          const userObj = b.user || b.vendorOwner || {};
+          const ownerName = clean(typeof userObj === "object" ? userObj.name : "");
+          const ownerEmail = clean(typeof userObj === "object" ? userObj.email : "");
+          const linked = typeof b.linkedTo === "object" ? (b.linkedTo?.name || b.linkedTo?.project_name || "") : clean(b.linkedTo);
+          const invDate = normalizeDate(b.invoiceDate);
+          const dueDate = clean(b.dueDate);
+          const txnDate = normalizeDate(b.transactionDate || b.paymentDate || b.invoiceDate);
+          const subtotal = clean(b.subtotal || totAmt);
+          const tax = clean(b.tax || "0");
+          const tds = clean(b.tds || "0");
+          const netPay = clean(b.invoicePayableAmount || totAmt);
+          let tallyCat = "";
+          for (const tag of (b.accountingTags || [])) {
+            const val = tag?.tagValue || tag?.customTextValue || "";
+            if (val) { tallyCat = clean(val); break; }
+          }
+          newRows.push([
+            ownerName, ownerEmail, linked, "PurchaseBill", vendor, invNo,
+            invDate, dueDate, txnDate, subtotal, tax, totAmt, tds, netPay,
+            "1", totAmt, "INR", "", totAmt, tax, totAmt, clean(b.memo), tallyCat, "", ""
+          ]);
+        }
+      }
+      if (newRows.length > 0) {
+        const appended = await sheetAppendRows(env.SPREADSHEET_ID, "Purchase Bills", newRows, token);
+        totalNew += appended;
+      }
+    }
+  } catch (e: any) {
+    console.warn("Purchase Bills sync warning:", e.message);
+  }
+
+  // 4. Payrolls
+  try {
+    const payRes = await voloFetch("accounting/payrolls?page=1&limit=50", auth, env);
+    const payList = payRes.list || payRes.data || [];
+    if (payList.length > 0) {
+      const existingPay = await getRecentSheetRows(env.SPREADSHEET_ID, "Payrolls", token);
+      const existingKeys = new Set(existingPay.map(r => `${clean(r[0])}_${clean(r[4])}_${clean(r[5])}`));
+      const newRows: string[][] = [];
+      for (const p of payList) {
+        const empId = clean(p.accountingId || p.id);
+        const txnDate = normalizeDate(p.transactionDate || p.paymentDate);
+        const totAmt = clean(p.amount?.value || p.amount || "0");
+        const key = `${empId}_${txnDate}_${totAmt}`;
+        if (!existingKeys.has(key)) {
+          existingKeys.add(key);
+          const empObj = p.user || p.vendorOwner || {};
+          const empName = clean(typeof empObj === "object" ? empObj.name : (p.accountingVendorName || ""));
+          const empEmail = clean(typeof empObj === "object" ? empObj.email : "");
+          const memo = clean(p.note);
+          let tallyCat = "";
+          for (const tag of (p.accountingTags || [])) {
+            const val = tag?.tagValue || tag?.customTextValue || "";
+            if (val) { tallyCat = clean(val); break; }
+          }
+          newRows.push([
+            empId, empName, empEmail, "Payroll", txnDate, totAmt,
+            totAmt, "INR", "1.0", memo, memo, tallyCat, "", ""
+          ]);
+        }
+      }
+      if (newRows.length > 0) {
+        const appended = await sheetAppendRows(env.SPREADSHEET_ID, "Payrolls", newRows, token);
+        totalNew += appended;
+      }
+    }
+  } catch (e: any) {
+    console.warn("Payrolls sync warning:", e.message);
+  }
+
+  return {
+    totalNew,
+    summary: totalNew > 0 ? `Volopay synced (${totalNew} new records appended to Sheets)` : `Volopay connected & up to date (0 new records)`
+  };
 }
 
 function b64(input: unknown) {

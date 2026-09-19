@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "mis-expenses-dashboard",
-  "account_id": "b037971d229c8b1bed1b76fc92a4f12b",
+  "account_id": "73311930cc40a74affb4aa61a7107291",
   "main": "src/worker.ts",
   "compatibility_date": "2026-08-01",
   "assets": {
@@ -12,8 +12,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "mis_expenses_dashboard",
-      "database_id": "631bd778-cd8b-46be-9f31-842969ef25a0"
+      "database_name": "mis_expenses_prod",
+      "database_id": "e9962978-c8fb-4950-8efc-28889c3c42c3"
     }
   ],
   "vars": {
