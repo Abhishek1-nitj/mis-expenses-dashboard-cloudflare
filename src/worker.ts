@@ -517,6 +517,8 @@ async function syncVolopayToSheets(env: Env, token: string) {
   const auth = await getVolopayAuth(env);
   let totalNew = 0;
 
+  let authError: string | null = null;
+
   // 1. Claims (reimbursements)
   try {
     const claimsRes = await voloFetch("accounting/reimbursements?page=1&limit=50", auth, env);
@@ -559,6 +561,9 @@ async function syncVolopayToSheets(env: Env, token: string) {
     }
   } catch (e: any) {
     console.warn("Claims sync warning:", e.message);
+    if (e.message?.includes("401") || e.message?.includes("sign in")) {
+      authError = "Volopay session expired. Run 1-Click Desktop Sync to update";
+    }
   }
 
   // 2. Expenses (card & upi)
@@ -574,9 +579,20 @@ async function syncVolopayToSheets(env: Env, token: string) {
         if (txnId && !existingTxnIds.has(txnId)) {
           existingTxnIds.add(txnId);
           const cardHolder = e.cardHolder || {};
-          const ownerName = clean(typeof cardHolder === "object" ? cardHolder.name : "");
+          const ownerName = clean(typeof cardHolder === "object" ? (cardHolder.displayName || cardHolder.name) : "");
           const ownerEmail = clean(typeof cardHolder === "object" ? cardHolder.email : "");
-          const linked = typeof e.linkedTo === "object" ? (e.linkedTo?.name || e.linkedTo?.project_name || "") : clean(e.linkedTo);
+          const projObj = e.project || {};
+          const deptObj = e.department || {};
+          let linked = "";
+          if (typeof projObj === "object" && projObj.name) {
+            linked = clean(projObj.name);
+          } else if (typeof deptObj === "object" && deptObj.name) {
+            linked = clean(deptObj.name);
+          } else if (typeof e.linkedTo === "object") {
+            linked = clean(e.linkedTo?.name || e.linkedTo?.project_name || "");
+          } else {
+            linked = clean(e.linkedTo);
+          }
           const ptype = e.expenseViaUpi ? "UPI" : "Card Expense";
           const merchant = clean(e.merchant);
           const pMerchant = clean(e.accountingVendorName || merchant);
@@ -606,6 +622,9 @@ async function syncVolopayToSheets(env: Env, token: string) {
     }
   } catch (e: any) {
     console.warn("Expenses sync warning:", e.message);
+    if (e.message?.includes("401") || e.message?.includes("sign in")) {
+      authError = "Volopay session expired. Run 1-Click Desktop Sync to update";
+    }
   }
 
   // 3. Purchase Bills
@@ -653,6 +672,9 @@ async function syncVolopayToSheets(env: Env, token: string) {
     }
   } catch (e: any) {
     console.warn("Purchase Bills sync warning:", e.message);
+    if (e.message?.includes("401") || e.message?.includes("sign in")) {
+      authError = "Volopay session expired. Run 1-Click Desktop Sync to update";
+    }
   }
 
   // 4. Payrolls
@@ -692,6 +714,16 @@ async function syncVolopayToSheets(env: Env, token: string) {
     }
   } catch (e: any) {
     console.warn("Payrolls sync warning:", e.message);
+    if (e.message?.includes("401") || e.message?.includes("sign in")) {
+      authError = "Volopay session expired. Run 1-Click Desktop Sync to update";
+    }
+  }
+
+  if (authError) {
+    return {
+      totalNew: 0,
+      summary: authError
+    };
   }
 
   return {
