@@ -201,6 +201,7 @@ def fetch_delta_smart(client, endpoint, cache_name, full_scan=False, limit=100, 
     new_count = 0
     updated_count = 0
     max_delta_pages = 5  # Scan up to 500 latest items
+    page_all_existing_and_settled = False
 
     while page <= max_delta_pages:
         params = {"page": page, "limit": limit}

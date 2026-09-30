@@ -173,7 +173,7 @@ async function syncStep(env: Env, url: URL, req?: Request) {
   try {
     const range = `'${sheetName.replaceAll("'", "''")}'!A${startRow}:Z`;
     const fetched = await sheetValues(env.SPREADSHEET_ID, range, token);
-    rows = fetched.slice(0, chunkSize);
+    rows = (mode === "delta" && offset > 0) ? fetched.slice(0, 500) : fetched.slice(0, chunkSize);
     if (fetched.length <= chunkSize) {
       isSheetDone = true;
     }

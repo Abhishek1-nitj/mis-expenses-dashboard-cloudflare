@@ -115,8 +115,24 @@ VOLOPAY_BASE_URL={self.base_url}
 
     def request(self, method: str, endpoint: str, params=None, json_data=None, timeout=30):
         url = endpoint if endpoint.startswith("http") else f"{self.base_url}/{endpoint.lstrip('/')}"
-        resp = self.session.request(method=method, url=url, params=params, json=json_data, timeout=timeout)
-        self._update_tokens_if_rotated(resp.headers)
+        
+        resp = None
+        for attempt in range(1, 4):
+            try:
+                resp = self.session.request(method=method, url=url, params=params, json=json_data, timeout=timeout)
+                self._update_tokens_if_rotated(resp.headers)
+                if resp.status_code in [502, 503, 504] and attempt < 3:
+                    time.sleep(1.2 * attempt)
+                    continue
+                break
+            except (requests.ConnectionError, requests.Timeout) as net_err:
+                if attempt < 3:
+                    time.sleep(1.2 * attempt)
+                    continue
+                raise net_err
+
+        if resp is None:
+            raise requests.ConnectionError(f"Failed to connect to {url}")
         
         if resp.status_code == 401:
             print("  🔄 401 detected: Auto-refreshing session tokens from Chrome...", flush=True)
