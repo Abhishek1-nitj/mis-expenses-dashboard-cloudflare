@@ -186,6 +186,10 @@ def fetch_delta_smart(client, endpoint, cache_name, full_scan=False, limit=100, 
 
     id_to_item = {get_record_id(it): it for it in cached_list if get_record_id(it)}
     
+    if client is None:
+        print(f"  ⚡ Using cached baseline for {cache_name} ({len(id_to_item)} items)...", flush=True)
+        return list(id_to_item.values()), True, {"new": 0, "updated": 0, "total": len(id_to_item)}
+
     if full_scan or len(cached_list) == 0:
         print(f"  🔄 Running Full Scan for {cache_name} from {CUTOFF_DATE_STR}...", flush=True)
         items = fetch_all_paginated(client, endpoint, cache_name, {"from_date": CUTOFF_DATE_STR}, limit=limit)
@@ -515,10 +519,24 @@ def process_payrolls(client, full_scan=False):
     rows = [PAYROLLS_HEADERS]
     
     for p in raw_payrolls:
-        emp_id = to_str(p.get("accountingId") or p.get("id"))
-        emp_obj = p.get("user") or p.get("vendorOwner") or {}
-        emp_name = to_str(emp_obj.get("name") if isinstance(emp_obj, dict) else (p.get("accountingVendorName") or ""))
-        emp_email = to_str(emp_obj.get("email") if isinstance(emp_obj, dict) else "")
+        vendor = p.get("vendor") or {}
+        user = p.get("user") or {}
+        vo = p.get("vendorOwner") or {}
+        
+        emp_id = to_str(vendor.get("employeeId") or p.get("accountingId") or p.get("id"))
+        emp_name = to_str(
+            vendor.get("name")
+            or (user.get("displayName") if isinstance(user, dict) else "")
+            or (user.get("name") if isinstance(user, dict) else "")
+            or (vo.get("name") if isinstance(vo, dict) else "")
+            or p.get("accountingVendorName")
+            or ""
+        )
+        emp_email = to_str(
+            vendor.get("email")
+            or (user.get("email") if isinstance(user, dict) else "")
+            or ""
+        )
         ptype = "Payroll"
         txn_date = format_date_dash(p.get("transactionDate") or p.get("paymentDate"))
         
@@ -541,7 +559,7 @@ def process_payrolls(client, full_scan=False):
                 tally_cat = to_str(tval)
                 break
         tally_tax = ""
-        payroll_proj = ""
+        payroll_proj = to_str(p.get("projectName") or vendor.get("projectName") or "")
         
         rows.append([
             emp_id, emp_name, emp_email, ptype, txn_date, tot_amt,
@@ -562,8 +580,10 @@ def copy_project_classification(gc, target_sh):
         print(f"Note on Project Classification: {e}")
 
 
-def run_sync(full_scan=False, trigger_d1=True, force_sheets_write=False):
+def run_sync(full_scan=False, trigger_d1=True, force_sheets_write=False, target_tab=None):
     mode_str = "Full Historical Scan" if full_scan else "⚡ Fast Incremental (Delta) Sync"
+    if target_tab:
+        mode_str += f" [Target Tab: {target_tab}]"
     print(f"Starting Volopay Sync ({mode_str})...")
     print(f"Target Sheet ID: {TARGET_SPREADSHEET_ID}\n")
     
@@ -591,41 +611,58 @@ def run_sync(full_scan=False, trigger_d1=True, force_sheets_write=False):
                 print("✓ Fresh Volopay tokens verified successfully!\n", flush=True)
             except Exception as v_err:
                 print(f"❌ Extracted tokens failed API test: {v_err}")
-                print("👉 Please log into https://iskconwhitefield.volopay.co.in in Google Chrome and re-run.")
-                return {"ok": False, "error": "Extracted tokens failed API test"}
+                if force_sheets_write or target_tab:
+                    print("⚡ Proceeding with local cache data to write sheets...", flush=True)
+                    client = None
+                else:
+                    print("👉 Please log into https://iskconwhitefield.volopay.co.in in Google Chrome and re-run.")
+                    return {"ok": False, "error": "Extracted tokens failed API test"}
         else:
-            print("👉 Please log into https://iskconwhitefield.volopay.co.in in Google Chrome and re-run.")
-            return {"ok": False, "error": "Could not extract fresh tokens from Chrome"}
+            if force_sheets_write or target_tab:
+                print("⚡ Chrome session not open. Proceeding with local cache data to write sheets...", flush=True)
+                client = None
+            else:
+                print("👉 Please log into https://iskconwhitefield.volopay.co.in in Google Chrome and re-run.")
+                return {"ok": False, "error": "Could not extract fresh tokens from Chrome"}
 
     t0 = time.time()
+    tab_filter = target_tab.strip().lower() if target_tab else None
     
     # 1. Claims
-    claims_rows, claims_changed, claims_stats = process_claims(client, full_scan=full_scan)
-    if claims_changed or full_scan or force_sheets_write:
-        update_sheet_tab(target_sh, "Claims", claims_rows)
-    else:
-        print(f"  ✓ [Claims] sheet already up to date ({claims_stats.get('new', 0)} new, {claims_stats.get('updated', 0)} updated). Skipping write.", flush=True)
+    claims_stats = {"new": 0, "updated": 0, "total": 0}
+    if not tab_filter or tab_filter in ["claims", "claim"]:
+        claims_rows, claims_changed, claims_stats = process_claims(client, full_scan=full_scan)
+        if claims_changed or full_scan or force_sheets_write:
+            update_sheet_tab(target_sh, "Claims", claims_rows)
+        else:
+            print(f"  ✓ [Claims] sheet already up to date ({claims_stats.get('new', 0)} new, {claims_stats.get('updated', 0)} updated). Skipping write.", flush=True)
     
     # 2. Expenses
-    expenses_rows, expenses_changed, expenses_stats = process_expenses(client, full_scan=full_scan)
-    if expenses_changed or full_scan or force_sheets_write:
-        update_sheet_tab(target_sh, "Expenses", expenses_rows)
-    else:
-        print(f"  ✓ [Expenses] sheet already up to date ({expenses_stats.get('new', 0)} new, {expenses_stats.get('updated', 0)} updated). Skipping write.", flush=True)
+    expenses_stats = {"new": 0, "updated": 0, "total": 0}
+    if not tab_filter or tab_filter in ["expenses", "expense"]:
+        expenses_rows, expenses_changed, expenses_stats = process_expenses(client, full_scan=full_scan)
+        if expenses_changed or full_scan or force_sheets_write:
+            update_sheet_tab(target_sh, "Expenses", expenses_rows)
+        else:
+            print(f"  ✓ [Expenses] sheet already up to date ({expenses_stats.get('new', 0)} new, {expenses_stats.get('updated', 0)} updated). Skipping write.", flush=True)
     
     # 3. Purchase Bills
-    bills_rows, bills_changed, bills_stats = process_purchase_bills(client, full_scan=full_scan)
-    if bills_changed or full_scan or force_sheets_write:
-        update_sheet_tab(target_sh, "Purchase Bills", bills_rows)
-    else:
-        print(f"  ✓ [Purchase Bills] sheet already up to date ({bills_stats.get('new', 0)} new, {bills_stats.get('updated', 0)} updated). Skipping write.", flush=True)
+    bills_stats = {"new": 0, "updated": 0, "total": 0}
+    if not tab_filter or tab_filter in ["purchase bills", "bills", "purchase_bills", "bill"]:
+        bills_rows, bills_changed, bills_stats = process_purchase_bills(client, full_scan=full_scan)
+        if bills_changed or full_scan or force_sheets_write:
+            update_sheet_tab(target_sh, "Purchase Bills", bills_rows)
+        else:
+            print(f"  ✓ [Purchase Bills] sheet already up to date ({bills_stats.get('new', 0)} new, {bills_stats.get('updated', 0)} updated). Skipping write.", flush=True)
     
     # 4. Payrolls
-    payrolls_rows, payrolls_changed, payrolls_stats = process_payrolls(client, full_scan=full_scan)
-    if payrolls_changed or full_scan or force_sheets_write:
-        update_sheet_tab(target_sh, "Payrolls", payrolls_rows)
-    else:
-        print(f"  ✓ [Payrolls] sheet already up to date ({payrolls_stats.get('new', 0)} new, {payrolls_stats.get('updated', 0)} updated). Skipping write.", flush=True)
+    payrolls_stats = {"new": 0, "updated": 0, "total": 0}
+    if not tab_filter or tab_filter in ["payrolls", "payroll"]:
+        payrolls_rows, payrolls_changed, payrolls_stats = process_payrolls(client, full_scan=full_scan)
+        if payrolls_changed or full_scan or force_sheets_write:
+            update_sheet_tab(target_sh, "Payrolls", payrolls_rows)
+        else:
+            print(f"  ✓ [Payrolls] sheet already up to date ({payrolls_stats.get('new', 0)} new, {payrolls_stats.get('updated', 0)} updated). Skipping write.", flush=True)
     
     # 5. Project Classification
     if full_scan:
@@ -682,7 +719,8 @@ def trigger_dashboard_sync():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--full", action="store_true", help="Perform full historical scan")
-    parser.add_argument("--force-write", action="store_true", help="Force rewrite all Google Sheet tabs even if delta has 0 changes")
+    parser.add_argument("--force-write", action="store_true", help="Force rewrite Google Sheet tabs even if delta has 0 changes")
     parser.add_argument("--no-d1", action="store_true", help="Skip triggering Cloudflare D1 sync")
+    parser.add_argument("--tab", type=str, default=None, help="Sync only a specific tab (e.g. Payrolls)")
     args = parser.parse_args()
-    run_sync(full_scan=args.full, trigger_d1=not args.no_d1, force_sheets_write=args.force_write)
+    run_sync(full_scan=args.full, trigger_d1=not args.no_d1, force_sheets_write=args.force_write, target_tab=args.tab)
