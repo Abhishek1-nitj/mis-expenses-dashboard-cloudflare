@@ -273,11 +273,115 @@ function App() {
     ];
   }, [projects]);
 
+  async function refreshVolopayTokensBeforeSync(): Promise<string> {
+    // 1. Try Chrome Extension bridge if installed
+    if ((window as any).__MIS_VOLOPAY_EXTENSION_INSTALLED) {
+      try {
+        const extPromise = new Promise<{ ok: boolean; message?: string }>((resolve) => {
+          const timeout = setTimeout(() => resolve({ ok: false, message: "Extension timeout" }), 2000);
+          function handler(e: MessageEvent) {
+            if (e.data && e.data.type === "MIS_TOKENS_READY") {
+              clearTimeout(timeout);
+              window.removeEventListener("message", handler);
+              resolve({ ok: e.data.ok, message: e.data.message });
+            }
+          }
+          window.addEventListener("message", handler);
+          window.postMessage({ type: "MIS_REQUEST_FRESH_TOKENS" }, "*");
+        });
+        const extRes = await extPromise;
+        if (extRes.ok) {
+          return "Session verified via Chrome Bridge";
+        }
+      } catch (e) {
+        console.warn("Extension bridge check skipped:", e);
+      }
+    }
+
+    // 2. Try Silent Local Daemon Bridge on 127.0.0.1:8765
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2500);
+      const res = await fetch("http://127.0.0.1:8765/sync-tokens", {
+        method: "POST",
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (res.ok) {
+        const d = await res.json();
+        return d.message || "Session verified via local bridge";
+      }
+    } catch {
+      // Local daemon not reachable (e.g. user on mobile or other device)
+    }
+
+    return "Verifying cloud session";
+  }
+
   async function sync() {
     if (syncing) return;
     setSyncing(true);
-    setSyncStatus("Connecting to cloud sync...");
+    setSyncStatus("Connecting to sync engine...");
     try {
+      // Stage 1: Fast healthcheck to see if the local Mac daemon is available
+      let localBridgeOnline = false;
+      try {
+        const pingCtrl = new AbortController();
+        const pingTimer = setTimeout(() => pingCtrl.abort(), 1500);
+        const pingRes = await fetch("http://127.0.0.1:8765/health", {
+          signal: pingCtrl.signal,
+        });
+        clearTimeout(pingTimer);
+        if (pingRes.ok) {
+          localBridgeOnline = true;
+        }
+      } catch {
+        localBridgeOnline = false;
+      }
+
+      if (localBridgeOnline) {
+        setSyncStatus("Pulling fresh Volopay data into Google Sheets...");
+        try {
+          const syncCtrl = new AbortController();
+          const syncTimer = setTimeout(() => syncCtrl.abort(), 120000); // 120s safety limit
+          const bridgeRes = await fetch("http://127.0.0.1:8765/trigger-full-sync?trigger_d1=false", {
+            method: "POST",
+            signal: syncCtrl.signal,
+          });
+          clearTimeout(syncTimer);
+          if (bridgeRes.ok) {
+            const bridgeData = await bridgeRes.json();
+            const summary = bridgeData.summary || "All sheets up to date";
+            setSyncStatus(`Sheets updated (${summary}). Reconciling dashboard...`);
+          } else {
+            console.warn("Local bridge responded with status:", bridgeRes.status);
+            setSyncStatus("Reconciling Google Sheets to dashboard...");
+          }
+        } catch (bridgeErr: any) {
+          console.warn("Bridge sync timeout/error:", bridgeErr);
+          setSyncStatus("Reconciling Google Sheets to dashboard...");
+        }
+      } else {
+        // Fallback: If on mobile/cloud without local bridge, check Chrome extension or proceed directly
+        if ((window as any).__MIS_VOLOPAY_EXTENSION_INSTALLED) {
+          try {
+            await new Promise((res) => {
+              const t = setTimeout(res, 1000);
+              window.addEventListener("message", function h(e) {
+                if (e.data && e.data.type === "MIS_TOKENS_READY") {
+                  clearTimeout(t);
+                  window.removeEventListener("message", h);
+                  res(true);
+                }
+              });
+              window.postMessage({ type: "MIS_REQUEST_FRESH_TOKENS" }, "*");
+            });
+          } catch {}
+        }
+        setSyncStatus("Syncing Google Sheets to dashboard...");
+      }
+
+      // Stage 2: Reconcile Google Sheets into Cloudflare D1
       let currentStep = 0;
       let currentOffset = 0;
       for (;;) {
@@ -299,7 +403,7 @@ function App() {
         const pctStr = data.progress ? ` (${data.progress}%)` : "";
         setSyncStatus((data.message || `Syncing ${data.stepName || ""}...`) + pctStr);
         if (data.done || !data.hasMore) {
-          setSyncStatus(`Sync complete! ${data.totals?.rows ?? ""} records active.`);
+          setSyncStatus(`Sync complete! ${data.totals?.rows ? Number(data.totals.rows).toLocaleString() : ""} records active.`);
           break;
         }
         currentStep = data.nextStep;
@@ -313,7 +417,7 @@ function App() {
       setTimeout(() => {
         setSyncing(false);
         setSyncStatus("");
-      }, 4000);
+      }, 5000);
     }
   }
 

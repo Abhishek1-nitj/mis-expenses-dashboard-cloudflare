@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "MIS Volopay 1-Click Sync Bridge",
+  "version": "1.0.0",
+  "description": "Enables 1-click Volopay expense sync directly from the MIS dashboard without terminal scripts.",
+  "permissions": [
+    "cookies",
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://iskconwhitefield.volopay.co.in/*",
+    "https://api-in.volopay.co/*",
+    "https://mis-expenses-dashboard.zoom-attendance-live.workers.dev/*",
+    "https://mis-expenses-dashboard.abhishek-nitj-002-1.workers.dev/*",
+    "http://localhost:*/*",
+    "http://127.0.0.1:*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://mis-expenses-dashboard.zoom-attendance-live.workers.dev/*",
+        "https://mis-expenses-dashboard.abhishek-nitj-002-1.workers.dev/*",
+        "http://localhost:*/*",
+        "http://127.0.0.1:*/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://iskconwhitefield.volopay.co.in/*"
+      ],
+      "js": ["volopay_content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "MIS Volopay Sync Bridge"
+  }
+}

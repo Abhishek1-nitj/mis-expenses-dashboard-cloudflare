@@ -23,6 +23,7 @@ import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
 from volopay_client import VolopayClient, sync_tokens_from_chrome
 
@@ -187,7 +188,8 @@ def fetch_delta_smart(client, endpoint, cache_name, full_scan=False, limit=100, 
     
     if full_scan or len(cached_list) == 0:
         print(f"  🔄 Running Full Scan for {cache_name} from {CUTOFF_DATE_STR}...", flush=True)
-        return fetch_all_paginated(client, endpoint, cache_name, {"from_date": CUTOFF_DATE_STR}, limit=limit)
+        items = fetch_all_paginated(client, endpoint, cache_name, {"from_date": CUTOFF_DATE_STR}, limit=limit)
+        return items, True, {"new": len(items), "updated": 0, "total": len(items)}
 
     print(f"  ⚡ Running Fast Delta Scan for {cache_name} (baseline: {len(id_to_item)} items)...", flush=True)
     
@@ -229,7 +231,11 @@ def fetch_delta_smart(client, endpoint, cache_name, full_scan=False, limit=100, 
                         page_all_existing_and_settled = False
                     else:
                         # Item already matches
-                        is_settled = new_status in ["paid", "settled", "paid_outside_volopay", "synced"]
+                        is_settled = (
+                            new_status in ["paid", "settled", "paid_outside_volopay", "synced", "verified", "approved", "completed"] or
+                            str(item.get("settlementStatus") or "").lower() in ["settled", "paid"] or
+                            str(item.get("transactionStatus") or "").lower() in ["paid", "settled", "paid_outside_volopay", "approved", "completed"]
+                        )
                         if not is_settled:
                             page_all_existing_and_settled = False
 
@@ -243,35 +249,39 @@ def fetch_delta_smart(client, endpoint, cache_name, full_scan=False, limit=100, 
             print(f"  ⚠️ Delta scan page {page} warning: {e}", flush=True)
             break
 
-    # Lookback scan for recently active pending items (within last 60 days)
-    lookback_date = (datetime.now() - timedelta(days=rolling_lookback_days)).strftime("%Y-%m-%d")
-    try:
-        res = client.get(endpoint, params={"page": 1, "limit": 100, "from_date": lookback_date}, timeout=30)
-        recent_items = res.get("list") or res.get("data") or []
-        for item in recent_items:
-            rec_id = get_record_id(item)
-            if not rec_id:
-                continue
-            if rec_id not in id_to_item:
-                id_to_item[rec_id] = item
-                new_count += 1
-            else:
-                existing = id_to_item[rec_id]
-                old_status = existing.get("status") or existing.get("accountingStatus") or existing.get("transactionStatus")
-                new_status = item.get("status") or item.get("accountingStatus") or item.get("transactionStatus")
-                if old_status != new_status:
+    # Lookback scan for recently active pending items (only if recent changes or pending items were found)
+    if (not page_all_existing_and_settled) or new_count > 0 or updated_count > 0:
+        lookback_date = (datetime.now() - timedelta(days=rolling_lookback_days)).strftime("%Y-%m-%d")
+        try:
+            res = client.get(endpoint, params={"page": 1, "limit": 100, "from_date": lookback_date}, timeout=15)
+            recent_items = res.get("list") or res.get("data") or []
+            for item in recent_items:
+                rec_id = get_record_id(item)
+                if not rec_id:
+                    continue
+                if rec_id not in id_to_item:
                     id_to_item[rec_id] = item
-                    updated_count += 1
-    except Exception as e:
-        pass
+                    new_count += 1
+                else:
+                    existing = id_to_item[rec_id]
+                    old_status = existing.get("status") or existing.get("accountingStatus") or existing.get("transactionStatus")
+                    new_status = item.get("status") or item.get("accountingStatus") or item.get("transactionStatus")
+                    if old_status != new_status:
+                        id_to_item[rec_id] = item
+                        updated_count += 1
+        except Exception as e:
+            pass
 
     merged_list = list(id_to_item.values())
+    has_changes = (new_count > 0 or updated_count > 0)
+    stats = {"new": new_count, "updated": updated_count, "total": len(merged_list)}
     print(f"  ✓ Delta results for {cache_name}: {new_count} new, {updated_count} updated. Total: {len(merged_list)} items.", flush=True)
 
-    with open(cache_file, "w") as f:
-        json.dump(merged_list, f)
+    if has_changes or not cache_file.exists():
+        with open(cache_file, "w") as f:
+            json.dump(merged_list, f)
 
-    return merged_list
+    return merged_list, has_changes, stats
 
 
 def fetch_all_paginated(client, endpoint, cache_name, params_extra=None, limit=100, max_retries=3):
@@ -313,7 +323,7 @@ def fetch_all_paginated(client, endpoint, cache_name, params_extra=None, limit=1
 
 def process_claims(client, full_scan=False):
     print("\n--- Processing Claims ---", flush=True)
-    raw_claims = fetch_delta_smart(client, "accounting/reimbursements", "claims_cache", full_scan=full_scan)
+    raw_claims, has_changes, stats = fetch_delta_smart(client, "accounting/reimbursements", "claims_cache", full_scan=full_scan)
     rows = [CLAIMS_HEADERS]
     
     for c in raw_claims:
@@ -322,7 +332,7 @@ def process_claims(client, full_scan=False):
         settle_date = format_date_display(c.get("settlementDate") or c.get("settledAt"))
         rtype = to_str(c.get("type", "out_of_pocket"))
         owner_obj = c.get("createdBy") or c.get("user") or {}
-        owner_name = to_str(owner_obj.get("name") if isinstance(owner_obj, dict) else c.get("claimOwner"))
+        owner_name = to_str((owner_obj.get("displayName") or owner_obj.get("name")) if isinstance(owner_obj, dict) else c.get("claimOwner"))
         owner_email = to_str(owner_obj.get("email") if isinstance(owner_obj, dict) else c.get("claimOwnerEmail"))
         
         linked = c.get("linkedTo") or ""
@@ -365,22 +375,30 @@ def process_claims(client, full_scan=False):
             sent_curr, "", "", "", "", "", remarks, receipt_str, approval_date,
             tally_cat, tally_tax
         ])
-    return rows
+    return rows, has_changes, stats
 
 
 def process_expenses(client, full_scan=False):
     print("\n--- Processing Expenses ---", flush=True)
-    raw_exp = fetch_delta_smart(client, "accounting/expenses", "expenses_cache", full_scan=full_scan)
+    raw_exp, has_changes, stats = fetch_delta_smart(client, "accounting/expenses", "expenses_cache", full_scan=full_scan)
     rows = [EXPENSES_HEADERS]
     
     for e in raw_exp:
         card_holder = e.get("cardHolder") or {}
-        owner_name = to_str(card_holder.get("name") if isinstance(card_holder, dict) else "")
+        owner_name = to_str((card_holder.get("displayName") or card_holder.get("name")) if isinstance(card_holder, dict) else "")
         owner_email = to_str(card_holder.get("email") if isinstance(card_holder, dict) else "")
         
-        linked = e.get("linkedTo") or ""
-        if isinstance(linked, dict):
-            linked = linked.get("name") or linked.get("project_name") or ""
+        # Resolve real project / department name
+        proj_obj = e.get("project") or {}
+        dept_obj = e.get("department") or {}
+        if isinstance(proj_obj, dict) and proj_obj.get("name"):
+            linked = proj_obj.get("name")
+        elif isinstance(dept_obj, dict) and dept_obj.get("name"):
+            linked = dept_obj.get("name")
+        elif isinstance(e.get("linkedTo"), dict):
+            linked = e["linkedTo"].get("name") or e["linkedTo"].get("project_name") or ""
+        else:
+            linked = to_str(e.get("linkedTo"))
             
         ptype = "Card Expense" if not e.get("expenseViaUpi") else "UPI"
         merchant = to_str(e.get("merchant"))
@@ -418,18 +436,19 @@ def process_expenses(client, full_scan=False):
             tot_amt, tot_amt, curr, txn_date, ledger_date, txn_id, parent_id,
             status, gst, note, curr, fx, sub_cat, tally_cat, tally_tax, receipts, ""
         ])
-    return rows
+    return rows, has_changes, stats
 
 
 def process_purchase_bills(client, full_scan=False):
     print("\n--- Processing Purchase Bills ---", flush=True)
-    raw_bills = fetch_delta_smart(client, "accounting/bill-pay", "bills_cache", full_scan=full_scan)
+    raw_bills, has_changes, stats = fetch_delta_smart(client, "accounting/bill-pay", "bills_cache", full_scan=full_scan)
     rows = [PURCHASE_BILLS_HEADERS]
     
     for b in raw_bills:
         user_obj = b.get("user") or b.get("vendorOwner") or {}
-        owner_name = to_str(user_obj.get("name") if isinstance(user_obj, dict) else "")
-        owner_email = to_str(user_obj.get("email") if isinstance(user_obj, dict) else "")
+        owner_name = to_str((user_obj.get("displayName") or user_obj.get("name")) if isinstance(user_obj, dict) else "")
+        v_owner = b.get("vendorOwner") or {}
+        owner_email = to_str(user_obj.get("email") if (isinstance(user_obj, dict) and user_obj.get("email")) else (v_owner.get("email") if isinstance(v_owner, dict) else ""))
         
         linked = b.get("linkedTo") or ""
         if isinstance(linked, dict):
@@ -487,12 +506,12 @@ def process_purchase_bills(client, full_scan=False):
             line_desc, str(subtotal), str(tax), str(inv_total), bill_desc,
             tally_cat, tally_tax, receipts
         ])
-    return rows
+    return rows, has_changes, stats
 
 
 def process_payrolls(client, full_scan=False):
     print("\n--- Processing Payrolls ---", flush=True)
-    raw_payrolls = fetch_delta_smart(client, "accounting/payrolls", "payrolls_cache", full_scan=full_scan)
+    raw_payrolls, has_changes, stats = fetch_delta_smart(client, "accounting/payrolls", "payrolls_cache", full_scan=full_scan)
     rows = [PAYROLLS_HEADERS]
     
     for p in raw_payrolls:
@@ -528,7 +547,7 @@ def process_payrolls(client, full_scan=False):
             emp_id, emp_name, emp_email, ptype, txn_date, tot_amt,
             tot_amt, curr, fx, memo, desc, tally_cat, tally_tax, payroll_proj
         ])
-    return rows
+    return rows, has_changes, stats
 
 
 def copy_project_classification(gc, target_sh):
@@ -543,54 +562,127 @@ def copy_project_classification(gc, target_sh):
         print(f"Note on Project Classification: {e}")
 
 
-def run_sync(full_scan=False):
+def run_sync(full_scan=False, trigger_d1=True, force_sheets_write=False):
     mode_str = "Full Historical Scan" if full_scan else "⚡ Fast Incremental (Delta) Sync"
     print(f"Starting Volopay Sync ({mode_str})...")
     print(f"Target Sheet ID: {TARGET_SPREADSHEET_ID}\n")
     
-    gc = get_gspread_client()
-    target_sh = gc.open_by_key(TARGET_SPREADSHEET_ID)
+    try:
+        gc = get_gspread_client()
+        target_sh = gc.open_by_key(TARGET_SPREADSHEET_ID)
+    except Exception as e:
+        print(f"⚠️ Google Sheets connection unavailable (network offline?): {e}", flush=True)
+        return {"ok": False, "error": f"Google Sheets connection unavailable: {e}"}
     
+    client = None
     try:
         client = VolopayClient()
+        # Actively test token validity
+        print("Verifying Volopay API connection...", flush=True)
+        client.get("company/projects", params={"limit": 1}, timeout=15)
+        print("✓ Volopay API connection active!\n", flush=True)
     except Exception as e:
-        print(f"Volopay client init error: {e}")
-        print("Attempting to sync tokens from Chrome...")
+        print(f"⚠️ Stored Volopay tokens expired or invalid: {e}")
+        print("🔄 Auto-syncing fresh session tokens from Google Chrome...", flush=True)
         if sync_tokens_from_chrome():
-            client = VolopayClient()
+            try:
+                client = VolopayClient()
+                client.get("company/projects", params={"limit": 1}, timeout=15)
+                print("✓ Fresh Volopay tokens verified successfully!\n", flush=True)
+            except Exception as v_err:
+                print(f"❌ Extracted tokens failed API test: {v_err}")
+                print("👉 Please log into https://iskconwhitefield.volopay.co.in in Google Chrome and re-run.")
+                return {"ok": False, "error": "Extracted tokens failed API test"}
         else:
-            print("Please ensure you are logged into https://iskconwhitefield.volopay.co.in in Chrome.")
-            return False
+            print("👉 Please log into https://iskconwhitefield.volopay.co.in in Google Chrome and re-run.")
+            return {"ok": False, "error": "Could not extract fresh tokens from Chrome"}
 
     t0 = time.time()
     
     # 1. Claims
-    claims_rows = process_claims(client, full_scan=full_scan)
-    update_sheet_tab(target_sh, "Claims", claims_rows)
+    claims_rows, claims_changed, claims_stats = process_claims(client, full_scan=full_scan)
+    if claims_changed or full_scan or force_sheets_write:
+        update_sheet_tab(target_sh, "Claims", claims_rows)
+    else:
+        print(f"  ✓ [Claims] sheet already up to date ({claims_stats.get('new', 0)} new, {claims_stats.get('updated', 0)} updated). Skipping write.", flush=True)
     
     # 2. Expenses
-    expenses_rows = process_expenses(client, full_scan=full_scan)
-    update_sheet_tab(target_sh, "Expenses", expenses_rows)
+    expenses_rows, expenses_changed, expenses_stats = process_expenses(client, full_scan=full_scan)
+    if expenses_changed or full_scan or force_sheets_write:
+        update_sheet_tab(target_sh, "Expenses", expenses_rows)
+    else:
+        print(f"  ✓ [Expenses] sheet already up to date ({expenses_stats.get('new', 0)} new, {expenses_stats.get('updated', 0)} updated). Skipping write.", flush=True)
     
     # 3. Purchase Bills
-    bills_rows = process_purchase_bills(client, full_scan=full_scan)
-    update_sheet_tab(target_sh, "Purchase Bills", bills_rows)
+    bills_rows, bills_changed, bills_stats = process_purchase_bills(client, full_scan=full_scan)
+    if bills_changed or full_scan or force_sheets_write:
+        update_sheet_tab(target_sh, "Purchase Bills", bills_rows)
+    else:
+        print(f"  ✓ [Purchase Bills] sheet already up to date ({bills_stats.get('new', 0)} new, {bills_stats.get('updated', 0)} updated). Skipping write.", flush=True)
     
     # 4. Payrolls
-    payrolls_rows = process_payrolls(client, full_scan=full_scan)
-    update_sheet_tab(target_sh, "Payrolls", payrolls_rows)
+    payrolls_rows, payrolls_changed, payrolls_stats = process_payrolls(client, full_scan=full_scan)
+    if payrolls_changed or full_scan or force_sheets_write:
+        update_sheet_tab(target_sh, "Payrolls", payrolls_rows)
+    else:
+        print(f"  ✓ [Payrolls] sheet already up to date ({payrolls_stats.get('new', 0)} new, {payrolls_stats.get('updated', 0)} updated). Skipping write.", flush=True)
     
     # 5. Project Classification
     if full_scan:
         copy_project_classification(gc, target_sh)
         
     duration = round(time.time() - t0, 1)
-    print(f"\n🎉 SYNC COMPLETED SUCCESSFULLY IN {duration}s!")
-    return True
+    total_new = claims_stats.get("new", 0) + expenses_stats.get("new", 0) + bills_stats.get("new", 0) + payrolls_stats.get("new", 0)
+    total_updated = claims_stats.get("updated", 0) + expenses_stats.get("updated", 0) + bills_stats.get("updated", 0) + payrolls_stats.get("updated", 0)
+    summary_str = f"{total_new} new, {total_updated} updated" if (total_new > 0 or total_updated > 0) else "All sheets up to date"
+
+    print(f"\n🎉 GOOGLE SHEET SYNC COMPLETED IN {duration}s! ({summary_str})", flush=True)
+
+    # Automatically refresh Cloudflare D1 Dashboard
+    if trigger_d1:
+        trigger_dashboard_sync()
+
+    return {
+        "ok": True,
+        "duration_sec": duration,
+        "total_new": total_new,
+        "total_updated": total_updated,
+        "summary": summary_str,
+        "changes": {
+            "claims": claims_stats,
+            "expenses": expenses_stats,
+            "purchase_bills": bills_stats,
+            "payrolls": payrolls_stats,
+        }
+    }
+
+
+def trigger_dashboard_sync():
+    print("\n--- Triggering Cloudflare Dashboard Sync ---", flush=True)
+    endpoints = [
+        "https://mis-expenses-dashboard.zoom-attendance-live.workers.dev",
+        "https://mis-expenses-dashboard.abhishek-nitj-002-1.workers.dev",
+    ]
+    for base in endpoints:
+        try:
+            step, offset = 0, 0
+            while True:
+                r = requests.post(f"{base}/api/sync?step={step}&offset={offset}&mode=delta", timeout=60)
+                data = r.json()
+                if data.get("done") or not data.get("hasMore"):
+                    totals = data.get("totals") or {}
+                    print(f"  ✓ Dashboard at {base} refreshed successfully ({totals.get('rows', 0)} rows, ₹{totals.get('total', 0):,.2f})", flush=True)
+                    break
+                step = data.get("nextStep")
+                offset = data.get("offset", 0)
+        except Exception as e:
+            print(f"  ⚠️ Warning refreshing {base}: {e}", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--full", action="store_true", help="Perform full historical scan")
+    parser.add_argument("--force-write", action="store_true", help="Force rewrite all Google Sheet tabs even if delta has 0 changes")
+    parser.add_argument("--no-d1", action="store_true", help="Skip triggering Cloudflare D1 sync")
     args = parser.parse_args()
-    run_sync(full_scan=args.full)
+    run_sync(full_scan=args.full, trigger_d1=not args.no_d1, force_sheets_write=args.force_write)

@@ -87,11 +87,12 @@ class VolopayClient:
             self._save_env(new_expiry)
 
     def _save_env(self, expiry=None):
+        exp_val = expiry or os.environ.get('VOLOPAY_EXPIRY', '')
         content = f"""# Volopay Authentication & API Configuration
 VOLOPAY_ACCESS_TOKEN={self.access_token}
 VOLOPAY_CLIENT={self.client}
 VOLOPAY_UID={self.uid}
-VOLOPAY_EXPIRY={expiry or os.environ.get('VOLOPAY_EXPIRY', '')}
+VOLOPAY_EXPIRY={exp_val}
 VOLOPAY_ACCOUNT={self.account}
 VOLOPAY_BASE_URL={self.base_url}
 """
@@ -99,6 +100,18 @@ VOLOPAY_BASE_URL={self.base_url}
             f.write(content)
         with open(ENV_FILE, "w") as f:
             f.write(content)
+        
+        mis3_env = Path("/Users/abhishekkumar/Desktop/MIS3 just expenses/.env.local")
+        if mis3_env.parent.exists():
+            with open(mis3_env, "w") as f:
+                f.write(content)
+                
+        push_tokens_to_cloudflare({
+            "access_token": self.access_token,
+            "client": self.client,
+            "uid": self.uid,
+            "expiry": exp_val
+        })
 
     def request(self, method: str, endpoint: str, params=None, json_data=None, timeout=30):
         url = endpoint if endpoint.startswith("http") else f"{self.base_url}/{endpoint.lstrip('/')}"
@@ -194,20 +207,50 @@ VOLOPAY_BASE_URL={self.base_url}
         return self.get(f"accounting/bill-pay/{bill_id}")
 
 
-def sync_tokens_from_chrome():
-    """Utility function to extract fresh session tokens from open Chrome tab if ever needed."""
+def push_tokens_to_cloudflare(tokens):
+    """Pushes fresh tokens to Cloudflare D1 Worker so web dashboard sync also succeeds."""
+    endpoints = [
+        "https://mis-expenses-dashboard.zoom-attendance-live.workers.dev/api/volopay/auth",
+        "https://mis-expenses-dashboard.abhishek-nitj-002-1.workers.dev/api/volopay/auth",
+    ]
+    for ep in endpoints:
+        try:
+            r = requests.post(ep, json={
+                "access_token": tokens.get("access_token"),
+                "client": tokens.get("client"),
+                "uid": tokens.get("uid"),
+                "expiry": tokens.get("expiry"),
+            }, timeout=8)
+            if r.status_code == 200:
+                print(f"  ✓ Fresh tokens saved to Cloudflare Worker ({ep.split('/')[2]})", flush=True)
+        except Exception as e:
+            print(f"  ⚠️ Warning pushing tokens to {ep}: {e}", flush=True)
+
+
+def sync_tokens_from_chrome(auto_open=False):
+    """Utility function to extract fresh session tokens from open Chrome tab passively (never disrupts user)."""
     import subprocess
     as_script = """
     tell application "Google Chrome"
         repeat with w in windows
             repeat with t in tabs of w
-                if (URL of t) starts with "https://iskconwhitefield.volopay.co.in" then
-                    return execute t javascript "JSON.stringify({
-                        access_token: localStorage.getItem('access-token'),
-                        client: localStorage.getItem('client'),
-                        uid: localStorage.getItem('uid'),
-                        expiry: localStorage.getItem('expiry')
-                    })"
+                if (URL of t) contains "volopay" then
+                    set rawJson to execute t javascript "(function() {
+                        function get(k) { return localStorage.getItem(k) || sessionStorage.getItem(k) || ''; }
+                        var at = get('access-token') || get('accessToken') || '';
+                        var cl = get('client') || '';
+                        if (!at || !cl || at === 'null' || cl === 'null') return '';
+                        return JSON.stringify({
+                            access_token: at,
+                            client: cl,
+                            uid: get('uid') || 'abhishek.nitj.002@gmail.com',
+                            expiry: get('expiry') || '',
+                            account: get('account') || 'iskconwhitefield'
+                        });
+                    })()"
+                    if rawJson is not "" and rawJson is not "null" then
+                        return rawJson
+                    end if
                 end if
             end repeat
         end repeat
@@ -217,26 +260,48 @@ def sync_tokens_from_chrome():
     res = subprocess.run(["osascript", "-e", as_script], capture_output=True, text=True)
     try:
         data = json.loads(res.stdout.strip())
-        if data.get("access_token") and data.get("client"):
+        access_tok = data.get("access_token")
+        client_tok = data.get("client")
+
+        if access_tok and client_tok:
+            uid = data.get("uid") or "abhishek.nitj.002@gmail.com"
+            expiry = data.get("expiry") or ""
+            account = data.get("account") or "iskconwhitefield"
             content = f"""# Volopay Authentication & API Configuration
-VOLOPAY_ACCESS_TOKEN={data['access_token']}
-VOLOPAY_CLIENT={data['client']}
-VOLOPAY_UID={data.get('uid', 'abhishek.nitj.002@gmail.com')}
-VOLOPAY_EXPIRY={data.get('expiry', '')}
-VOLOPAY_ACCOUNT=iskconwhitefield
+VOLOPAY_ACCESS_TOKEN={access_tok}
+VOLOPAY_CLIENT={client_tok}
+VOLOPAY_UID={uid}
+VOLOPAY_EXPIRY={expiry}
+VOLOPAY_ACCOUNT={account}
 VOLOPAY_BASE_URL=https://api-in.volopay.co/api/v3
 """
             with open(ENV_FILE_LOCAL, "w") as f:
                 f.write(content)
             with open(ENV_FILE, "w") as f:
                 f.write(content)
-            print("Successfully refreshed Volopay tokens from Chrome!")
+            
+            # Also sync to MIS3 folder if it exists
+            mis3_env = Path("/Users/abhishekkumar/Desktop/MIS3 just expenses/.env.local")
+            if mis3_env.parent.exists():
+                with open(mis3_env, "w") as f:
+                    f.write(content)
+
+            print("  ✅ Extracted Volopay session tokens from Chrome successfully!", flush=True)
+            
+            # Push to Cloudflare D1
+            push_tokens_to_cloudflare({
+                "access_token": access_tok,
+                "client": client_tok,
+                "uid": uid,
+                "expiry": expiry
+            })
             return True
         else:
-            print("Could not find active Volopay session in Chrome.")
+            print("  ❌ Could not extract Volopay session from Chrome.")
+            print("  👉 Please log in to https://iskconwhitefield.volopay.co.in in Google Chrome and re-run.")
             return False
     except Exception as e:
-        print(f"Error syncing tokens: {e}")
+        print(f"  ❌ Error syncing tokens: {e}")
         return False
 
 

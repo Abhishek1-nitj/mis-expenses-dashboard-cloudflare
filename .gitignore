@@ -26,6 +26,7 @@ CF\ API\ Token*
 !tsconfig.json
 !wrangler.jsonc
 !sync_engine/**
+!extension/**
 
 
 

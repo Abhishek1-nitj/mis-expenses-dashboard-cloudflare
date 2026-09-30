@@ -13,6 +13,7 @@ const sheetSequence: TabKey[] = ["Purchase Bills", "Expenses", "Claims", "Payrol
 export default {
   async fetch(req: Request, env: Env) {
     const url = new URL(req.url);
+
     if (url.pathname === "/api/sync" && req.method === "POST") {
       try {
         return json(await syncStep(env, url, req));
@@ -24,7 +25,17 @@ export default {
         });
       }
     }
+
     if (url.pathname === "/api/volopay/auth") {
+      if (req.method === "OPTIONS") {
+        return new Response(null, {
+          headers: {
+            "access-control-allow-origin": "*",
+            "access-control-allow-methods": "GET, POST, OPTIONS",
+            "access-control-allow-headers": "content-type",
+          }
+        });
+      }
       if (req.method === "POST") {
         try {
           const body = await req.json() as any;
@@ -46,17 +57,18 @@ export default {
       const rows = await env.DB.prepare("SELECT key, updated_at FROM volopay_auth").all();
       return json({ ok: true, tokens: rows.results });
     }
+
     if (url.pathname === "/api/classifications") return json(await classifications(env));
     if (url.pathname === "/api/projects") return json(await projects(env, url.searchParams.get("classification") || "", dateWhere(url)));
     if (url.pathname === "/api/summary") return json(await summary(env, url.searchParams.get("classification") || "", url.searchParams.get("project") || "", dateWhere(url)));
     if (url.pathname === "/api/status") return json(await status(env));
+
     const res = await env.ASSETS.fetch(req);
     const headers = new Headers(res.headers);
     headers.set("cache-control", "no-store, max-age=0");
     return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
   },
 };
-
 
 async function syncStep(env: Env, url: URL, req?: Request) {
   let stepVal = url.searchParams.get("step");
@@ -80,16 +92,8 @@ async function syncStep(env: Env, url: URL, req?: Request) {
   const token = await accessToken(env);
   const now = new Date().toISOString();
 
-  // Step 0: Sync Volopay into Google Sheets + Sync Classifications into D1
+  // Step 0: Sync Master Classifications from Google Sheets into D1
   if (step === 0) {
-    let voloMsg = "Volopay verified";
-    try {
-      const voloRes = await syncVolopayToSheets(env, token);
-      voloMsg = voloRes.summary;
-    } catch (vErr: any) {
-      console.warn("Volopay sync warning (falling back to Google Sheets):", vErr.message);
-      voloMsg = `Volopay check (${vErr.message.slice(0, 50)})`;
-    }
     const count = await syncClassifications(env, token, now);
     return {
       hasMore: true,
@@ -97,14 +101,17 @@ async function syncStep(env: Env, url: URL, req?: Request) {
       nextStep: 1,
       offset: 0,
       mode,
-      stepName: "Volopay & Classifications",
-      message: `${voloMsg}. Classifications synced (${count} rules). Starting Purchase Bills...`,
+      voloStatus: "ok",
+      stepName: "Classifications",
+      message: `Master classifications synced (${count} rules). Starting Purchase Bills...`,
       progress: 10,
     };
   }
 
-  // Final Step: Return summary totals
+  // Final Step: Return summary totals and prune orphaned invalid records
   if (step > sheetSequence.length) {
+    // Final sanity cleanup: remove any historical corrupted rows
+    await env.DB.prepare("DELETE FROM expenses WHERE merchant = '[object Object]' OR merchant LIKE '%[object Object]%'").run();
     const totals = await env.DB.prepare("SELECT COUNT(*) rows, ROUND(SUM(amount),2) total FROM expenses").first();
     return {
       hasMore: false,
@@ -120,7 +127,7 @@ async function syncStep(env: Env, url: URL, req?: Request) {
     };
   }
 
-  // Steps 1..4: Process sheets
+  // Steps 1..4: Process sheets (Purchase Bills, Expenses, Claims, Payrolls)
   const sheetIndex = step - 1;
   const sheetName = sheetSequence[sheetIndex];
   const cfg = tabs[sheetName];
@@ -133,28 +140,52 @@ async function syncStep(env: Env, url: URL, req?: Request) {
     classMap.set(r.project_key, r.classification);
   }
 
-  const isDelta = mode === "delta";
+  const chunkSize = 250;
   let startRow: number;
   let endRow: number;
   let isSheetDone = false;
 
-  if (isDelta) {
-    // In delta mode, find the highest valid row currently in D1 for this sheet
-    const maxRes = await env.DB.prepare("SELECT COALESCE(MAX(source_row), 1) as max_row FROM expenses WHERE source = ? AND amount > 0 AND expense_date != ''").bind(sheetName).first() as { max_row: number } | null;
-    const currentMax = maxRes?.max_row || 1;
-    // Overlap by 50 rows to ensure recent updates or edits are refreshed
-    startRow = Math.max(2, currentMax - 50);
-    endRow = startRow + 500; // Fetch up to 500 latest rows
-    isSheetDone = true; // Delta mode syncs the delta in 1 fast pass per sheet
+  if (mode === "delta") {
+    // Delta Mode: sync the first 500 rows (newest records) + tail 500 rows
+    if (offset === 0) {
+      startRow = 2;
+      endRow = 501;
+    } else {
+      // Offset > 0: inspect tail rows
+      let totalCount = 1000;
+      try {
+        const colA = await sheetValues(env.SPREADSHEET_ID, `'${sheetName.replaceAll("'", "''")}'!A:A`, token);
+        totalCount = colA.length;
+      } catch {
+        totalCount = 1000;
+      }
+      startRow = Math.max(2, totalCount - 500);
+      endRow = totalCount;
+      isSheetDone = true;
+    }
   } else {
-    // Full sync paginates in safe 250-row chunks
-    const chunkSize = 250;
-    startRow = offset + 1;
-    endRow = offset + chunkSize;
+    // Full Mode: paginates sequentially through all rows from row 2
+    startRow = offset + 2;
+    endRow = startRow + chunkSize - 1;
   }
 
-  const range = `'${sheetName.replaceAll("'", "''")}'!A${startRow}:Z${endRow}`;
-  const rows = await sheetValues(env.SPREADSHEET_ID, range, token);
+  let rows: string[][] = [];
+  try {
+    const range = `'${sheetName.replaceAll("'", "''")}'!A${startRow}:Z`;
+    const fetched = await sheetValues(env.SPREADSHEET_ID, range, token);
+    rows = fetched.slice(0, chunkSize);
+    if (fetched.length <= chunkSize) {
+      isSheetDone = true;
+    }
+  } catch (err: any) {
+    console.warn(`Fetch range error for ${sheetName} at row ${startRow}:`, err?.message);
+    rows = [];
+    isSheetDone = true;
+  }
+
+  if (rows.length === 0) {
+    isSheetDone = true;
+  }
 
   const statements: any[] = [];
   let validRowsCount = 0;
@@ -173,7 +204,7 @@ async function syncStep(env: Env, url: URL, req?: Request) {
 
     statements.push(
       env.DB.prepare(
-        "INSERT OR REPLACE INTO expenses (id, source, source_row, project, classification, month_key, month_label, expense_date, amount, merchant, category, raw_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT OR REPLACE INTO expenses (id, source, source_row, project, classification, month_key, month_label, expense_date, amount, merchant, category, raw_json, created_at, sync_batch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       ).bind(
         parsed.id,
         sheetName,
@@ -187,7 +218,8 @@ async function syncStep(env: Env, url: URL, req?: Request) {
         parsed.merchant,
         parsed.category,
         JSON.stringify(row),
-        now
+        now,
+        `${sheetName}_${now.slice(0, 10)}`
       )
     );
   }
@@ -216,15 +248,26 @@ async function syncStep(env: Env, url: URL, req?: Request) {
     }
   }
 
-  if (!isDelta) {
-    isSheetDone = rows.length < 250;
+  if (mode === "full") {
+    isSheetDone = rows.length < chunkSize;
+    // When full sync finishes for this sheet, prune any stale tail rows!
+    if (isSheetDone) {
+      const finalMaxRow = startRow + rows.length - 1;
+      await env.DB.prepare("DELETE FROM expenses WHERE source = ? AND source_row > ?").bind(sheetName, finalMaxRow).run();
+    }
+  } else {
+    // In delta mode: offset 0 -> next pass offset 500 -> then done
+    if (offset === 0) {
+      isSheetDone = false;
+    }
   }
+
   const nextStep = isSheetDone ? step + 1 : step;
-  const nextOffset = isSheetDone ? 0 : offset + 250;
+  const nextOffset = isSheetDone ? 0 : offset + chunkSize;
 
   const progress = Math.min(95, Math.round(15 + (step / 5) * 80));
   const msg = isSheetDone
-    ? `Synced ${sheetName} (${validRowsCount} recent rows updated).`
+    ? `Synced ${sheetName} (${validRowsCount} rows updated).`
     : `Syncing ${sheetName} (rows ${startRow} - ${endRow})...`;
 
   return {
@@ -285,7 +328,10 @@ function parseRow(source: TabKey, row: string[], rowNo: number) {
   const amount = Number(String(row[cfg.amount] || "0").replace(/,/g, ""));
   if (!date || !Number.isFinite(amount)) return null;
   const d = new Date(date + "T00:00:00Z");
+  if (isNaN(d.getTime())) return null;
   const monthKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  const merchant = extractMerchant(row[cfg.merchant]);
+
   return {
     id: `${source}:${rowNo}`,
     project: normalizeProject(source === "Payrolls" ? "Payroll" : clean(row[cfg.project]) || "Unassigned"),
@@ -293,24 +339,81 @@ function parseRow(source: TabKey, row: string[], rowNo: number) {
     monthLabel: d.toLocaleString("en-US", { month: "short", year: "numeric", timeZone: "UTC" }).replace(" ", "-"),
     date,
     amount,
-    merchant: clean(row[cfg.merchant]),
+    merchant,
     category: clean(row[cfg.category]),
   };
 }
 
-function normalizeDate(v?: string) {
+function extractMerchant(v: any): string {
+  if (!v) return "";
+  if (typeof v === "object") {
+    return clean(v.name || v.displayName || v.vendorName || "");
+  }
+  const s = String(v).trim();
+  if (s === "[object Object]" || s.toLowerCase().includes("[object object]")) {
+    return "";
+  }
+  return clean(s);
+}
+
+function normalizeDate(v?: any): string {
   if (!v) return "";
   const s = String(v).trim();
+  if (!s || s === "[object Object]" || s.toLowerCase().includes("[object object]")) return "";
+
+  // 1. ISO format: YYYY-MM-DD
   const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  const numeric = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-  if (numeric) return `${Number(numeric[3].length === 2 ? "20" + numeric[3] : numeric[3])}-${String(Number(numeric[1])).padStart(2, "0")}-${String(Number(numeric[2])).padStart(2, "0")}`;
+  if (iso) {
+    const yyyy = Number(iso[1]);
+    const mm = Number(iso[2]);
+    const dd = Number(iso[3]);
+    if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+      return `${yyyy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+    }
+  }
+
+  // 2. Excel numeric date serial (e.g. 46290 -> 2026-09-25)
+  if (/^\d{5}$/.test(s)) {
+    const serial = Number(s);
+    if (serial > 30000 && serial < 60000) {
+      const dt = new Date(Math.round((serial - 25569) * 86400 * 1000));
+      if (!isNaN(dt.getTime())) {
+        return dt.toISOString().slice(0, 10);
+      }
+    }
+  }
+
+  // 3. Indian format DD/MM/YYYY or DD/MM/YY (or fallback MM/DD/YYYY if DD > 12)
+  const slash = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (slash) {
+    let p1 = Number(slash[1]);
+    let p2 = Number(slash[2]);
+    let yyyy = Number(slash[3].length === 2 ? "20" + slash[3] : slash[3]);
+    let day = p1;
+    let month = p2;
+    // If month > 12 and day <= 12, it was MM/DD/YYYY
+    if (month > 12 && day <= 12) {
+      day = p2;
+      month = p1;
+    }
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return `${yyyy}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+  }
+
+  // 4. Text month: DD-Mon-YYYY or DD Mon YYYY (e.g. 07-Sep-2026, 06 Sep 2026)
   const m = s.match(/^(\d{1,2})[-/ ]([A-Za-z]{3,})[-/ ](\d{2,4})$/);
-  if (!m) return "";
-  const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
-  const mm = months.indexOf(m[2].slice(0, 3).toLowerCase()) + 1;
-  const yyyy = Number(m[3].length === 2 ? "20" + m[3] : m[3]);
-  return mm ? `${yyyy}-${String(mm).padStart(2, "0")}-${String(Number(m[1])).padStart(2, "0")}` : "";
+  if (m) {
+    const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+    const mm = months.indexOf(m[2].slice(0, 3).toLowerCase()) + 1;
+    const yyyy = Number(m[3].length === 2 ? "20" + m[3] : m[3]);
+    const dd = Number(m[1]);
+    if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+      return `${yyyy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+    }
+  }
+
+  return "";
 }
 
 const clean = (v?: string) => String(v || "").trim();
@@ -326,7 +429,13 @@ function cleanKey(v: string) {
     .trim();
 }
 
-const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), {
+  status,
+  headers: {
+    "content-type": "application/json",
+    "access-control-allow-origin": "*"
+  }
+});
 
 async function classifications(env: Env) {
   const rows = await env.DB.prepare("SELECT classification, ROUND(SUM(amount),2) total FROM expenses GROUP BY classification ORDER BY classification").all();
@@ -397,26 +506,6 @@ async function sheetValues(id: string, range: string, token: string): Promise<st
   return ((await res.json()) as { values?: string[][] }).values || [];
 }
 
-async function sheetAppendRows(id: string, sheetTitle: string, rows: (string | number)[][], token: string): Promise<number> {
-  if (!rows || rows.length === 0) return 0;
-  const range = `'${sheetTitle.replaceAll("'", "''")}'!A:Z`;
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ values: rows }),
-  });
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error(`Sheet append error for ${sheetTitle}:`, errText);
-    return 0;
-  }
-  return rows.length;
-}
-
 async function accessToken(env: Env) {
   const sa = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT_JSON);
   const now = Math.floor(Date.now() / 1000);
@@ -432,304 +521,6 @@ async function accessToken(env: Env) {
   });
   if (!res.ok) throw new Error(await res.text());
   return ((await res.json()) as { access_token: string }).access_token;
-}
-
-async function getVolopayAuth(env: Env) {
-  try {
-    const rows = await env.DB.prepare("SELECT key, value FROM volopay_auth").all();
-    const map: Record<string, string> = {};
-    for (const r of (rows.results || []) as { key: string; value: string }[]) {
-      map[r.key] = r.value;
-    }
-    return {
-      accessToken: map["access_token"] || env.VOLOPAY_ACCESS_TOKEN || "mek2wR2Ze6wc-Xh6GLSSxA",
-      client: map["client"] || env.VOLOPAY_CLIENT || "RXXI4JNxICLlg96mwWzP-g",
-      uid: map["uid"] || env.VOLOPAY_UID || "abhishek.nitj.002@gmail.com",
-      account: map["account"] || env.VOLOPAY_ACCOUNT || "iskconwhitefield",
-      baseUrl: "https://api-in.volopay.co/api/v3",
-    };
-  } catch {
-    return {
-      accessToken: env.VOLOPAY_ACCESS_TOKEN || "mek2wR2Ze6wc-Xh6GLSSxA",
-      client: env.VOLOPAY_CLIENT || "RXXI4JNxICLlg96mwWzP-g",
-      uid: env.VOLOPAY_UID || "abhishek.nitj.002@gmail.com",
-      account: env.VOLOPAY_ACCOUNT || "iskconwhitefield",
-      baseUrl: "https://api-in.volopay.co/api/v3",
-    };
-  }
-}
-
-async function voloFetch(endpoint: string, auth: any, env: Env) {
-  const url = `${auth.baseUrl}/${endpoint.replace(/^\//, "")}`;
-  const res = await fetch(url, {
-    headers: {
-      "access-token": auth.accessToken,
-      client: auth.client,
-      uid: auth.uid,
-      "token-type": "Bearer",
-      account: auth.account,
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-      Origin: `https://${auth.account}.volopay.co.in`,
-      Referer: `https://${auth.account}.volopay.co.in/`,
-      Accept: "application/json, text/plain, */*",
-    },
-  });
-
-  // Handle token rotation automatically
-  const newAccess = res.headers.get("access-token");
-  const newClient = res.headers.get("client");
-  const newExpiry = res.headers.get("expiry");
-  if (newAccess && (newAccess !== auth.accessToken || newClient !== auth.client)) {
-    auth.accessToken = newAccess;
-    if (newClient) auth.client = newClient;
-    const now = new Date().toISOString();
-    try {
-      await env.DB.batch([
-        env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('access_token', ?, ?)").bind(newAccess, now),
-        env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('client', ?, ?)").bind(newClient || auth.client, now),
-        ...(newExpiry ? [env.DB.prepare("INSERT OR REPLACE INTO volopay_auth(key, value, updated_at) VALUES('expiry', ?, ?)").bind(newExpiry, now)] : []),
-      ]);
-    } catch (dbErr) {
-      console.warn("Could not save rotated tokens to D1:", dbErr);
-    }
-  }
-
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Volopay ${res.status}: ${errText.slice(0, 200)}`);
-  }
-  return res.json() as Promise<any>;
-}
-
-async function getRecentSheetRows(id: string, sheetTitle: string, token: string, maxRows = 300): Promise<string[][]> {
-  try {
-    const colE = await sheetValues(id, `'${sheetTitle.replaceAll("'", "''")}'!E:E`, token);
-    const total = colE.length;
-    if (total <= 1) return [];
-    const start = Math.max(2, total - maxRows);
-    return await sheetValues(id, `'${sheetTitle.replaceAll("'", "''")}'!A${start}:Z${total + 50}`, token);
-  } catch {
-    return [];
-  }
-}
-
-async function syncVolopayToSheets(env: Env, token: string) {
-  const auth = await getVolopayAuth(env);
-  let totalNew = 0;
-
-  let authError: string | null = null;
-
-  // 1. Claims (reimbursements)
-  try {
-    const claimsRes = await voloFetch("accounting/reimbursements?page=1&limit=50", auth, env);
-    const claimsList = claimsRes.list || claimsRes.data || [];
-    if (claimsList.length > 0) {
-      const existingClaims = await getRecentSheetRows(env.SPREADSHEET_ID, "Claims", token);
-      const existingKeys = new Set(existingClaims.map(r => `${clean(r[1])}_${clean(r[7])}_${clean(r[8])}`));
-      const newRows: string[][] = [];
-      for (const c of claimsList) {
-        const txnDate = normalizeDate(c.transactionDate || c.travelDate || c.created_at);
-        const merchant = clean(c.merchant);
-        const amount = String(c.amountToBePaid || c.amount?.value || c.amount || "0");
-        const key = `${txnDate}_${merchant}_${amount}`;
-        if (!existingKeys.has(key)) {
-          existingKeys.add(key);
-          const ownerObj = c.createdBy || c.user || {};
-          const ownerName = clean(typeof ownerObj === "object" ? ownerObj.name : c.claimOwner);
-          const ownerEmail = clean(typeof ownerObj === "object" ? ownerObj.email : c.claimOwnerEmail);
-          const linked = typeof c.linkedTo === "object" ? (c.linkedTo?.name || c.linkedTo?.project_name || "") : clean(c.linkedTo);
-          const curr = clean(c.amount?.currency || "INR");
-          const voloCat = clean(c.accountingVendorName || c.category || "Other");
-          const status = clean(c.status || c.accountingStatus);
-          const remarks = clean(c.memo || c.accountingMemo);
-          let tallyCat = "";
-          for (const tag of (c.accountingTags || [])) {
-            const val = tag?.tagValue || tag?.customTextValue || "";
-            if (val) { tallyCat = clean(val); break; }
-          }
-          newRows.push([
-            clean(c.created_at || c.createdAt), txnDate, clean(c.settlementDate), clean(c.type || "out_of_pocket"),
-            ownerName, ownerEmail, linked, merchant, amount, curr, voloCat, status, amount, curr,
-            "", "", "", "", "", remarks, "", clean(c.approvalDate), tallyCat, ""
-          ]);
-        }
-      }
-      if (newRows.length > 0) {
-        const appended = await sheetAppendRows(env.SPREADSHEET_ID, "Claims", newRows, token);
-        totalNew += appended;
-      }
-    }
-  } catch (e: any) {
-    console.warn("Claims sync warning:", e.message);
-    if (e.message?.includes("401") || e.message?.includes("sign in")) {
-      authError = "Volopay session expired. Run 1-Click Desktop Sync to update";
-    }
-  }
-
-  // 2. Expenses (card & upi)
-  try {
-    const expRes = await voloFetch("accounting/expenses?page=1&limit=50", auth, env);
-    const expList = expRes.list || expRes.data || [];
-    if (expList.length > 0) {
-      const existingExp = await getRecentSheetRows(env.SPREADSHEET_ID, "Expenses", token);
-      const existingTxnIds = new Set(existingExp.map(r => clean(r[11])));
-      const newRows: string[][] = [];
-      for (const e of expList) {
-        const txnId = clean(e.accountingId || e.id);
-        if (txnId && !existingTxnIds.has(txnId)) {
-          existingTxnIds.add(txnId);
-          const cardHolder = e.cardHolder || {};
-          const ownerName = clean(typeof cardHolder === "object" ? (cardHolder.displayName || cardHolder.name) : "");
-          const ownerEmail = clean(typeof cardHolder === "object" ? cardHolder.email : "");
-          const projObj = e.project || {};
-          const deptObj = e.department || {};
-          let linked = "";
-          if (typeof projObj === "object" && projObj.name) {
-            linked = clean(projObj.name);
-          } else if (typeof deptObj === "object" && deptObj.name) {
-            linked = clean(deptObj.name);
-          } else if (typeof e.linkedTo === "object") {
-            linked = clean(e.linkedTo?.name || e.linkedTo?.project_name || "");
-          } else {
-            linked = clean(e.linkedTo);
-          }
-          const ptype = e.expenseViaUpi ? "UPI" : "Card Expense";
-          const merchant = clean(e.merchant);
-          const pMerchant = clean(e.accountingVendorName || merchant);
-          const totAmt = clean(e.amount?.value || e.amount || "0");
-          const curr = clean(e.amount?.currency || "INR");
-          const txnDate = normalizeDate(e.transactionDate || e.accountingDate);
-          const ledgerDate = clean(e.accountingDate || e.transactionDate);
-          const status = clean(e.accountingStatus || e.transactionStatus);
-          const gst = e.gstApplied ? "Yes" : "";
-          const note = clean(e.memo);
-          let tallyCat = "";
-          for (const tag of (e.accountingTags || [])) {
-            const val = tag?.tagValue || tag?.customTextValue || "";
-            if (val) { tallyCat = clean(val); break; }
-          }
-          newRows.push([
-            ownerName, ownerEmail, linked, ptype, merchant, pMerchant,
-            totAmt, totAmt, curr, txnDate, ledgerDate, txnId, "",
-            status, gst, note, curr, "1", "", tallyCat, "", "", ""
-          ]);
-        }
-      }
-      if (newRows.length > 0) {
-        const appended = await sheetAppendRows(env.SPREADSHEET_ID, "Expenses", newRows, token);
-        totalNew += appended;
-      }
-    }
-  } catch (e: any) {
-    console.warn("Expenses sync warning:", e.message);
-    if (e.message?.includes("401") || e.message?.includes("sign in")) {
-      authError = "Volopay session expired. Run 1-Click Desktop Sync to update";
-    }
-  }
-
-  // 3. Purchase Bills
-  try {
-    const billsRes = await voloFetch("accounting/bill-pay?page=1&limit=50", auth, env);
-    const billsList = billsRes.list || billsRes.data || [];
-    if (billsList.length > 0) {
-      const existingBills = await getRecentSheetRows(env.SPREADSHEET_ID, "Purchase Bills", token);
-      const existingInvKeys = new Set(existingBills.map(r => `${clean(r[4])}_${clean(r[5])}_${clean(r[11])}`));
-      const newRows: string[][] = [];
-      for (const b of billsList) {
-        const vendor = clean(b.vendor?.name || b.accountingVendorName || "");
-        const invNo = clean(b.invoiceNumber || "");
-        const totAmt = clean(b.invoicePayableAmount || b.invoiceGrossTotal || b.amountToBePaid || "0");
-        const key = `${vendor}_${invNo}_${totAmt}`;
-        if (!existingInvKeys.has(key)) {
-          existingInvKeys.add(key);
-          const userObj = b.user || b.vendorOwner || {};
-          const ownerName = clean(typeof userObj === "object" ? userObj.name : "");
-          const ownerEmail = clean(typeof userObj === "object" ? userObj.email : "");
-          const linked = typeof b.linkedTo === "object" ? (b.linkedTo?.name || b.linkedTo?.project_name || "") : clean(b.linkedTo);
-          const invDate = normalizeDate(b.invoiceDate);
-          const dueDate = clean(b.dueDate);
-          const txnDate = normalizeDate(b.transactionDate || b.paymentDate || b.invoiceDate);
-          const subtotal = clean(b.subtotal || totAmt);
-          const tax = clean(b.tax || "0");
-          const tds = clean(b.tds || "0");
-          const netPay = clean(b.invoicePayableAmount || totAmt);
-          let tallyCat = "";
-          for (const tag of (b.accountingTags || [])) {
-            const val = tag?.tagValue || tag?.customTextValue || "";
-            if (val) { tallyCat = clean(val); break; }
-          }
-          newRows.push([
-            ownerName, ownerEmail, linked, "PurchaseBill", vendor, invNo,
-            invDate, dueDate, txnDate, subtotal, tax, totAmt, tds, netPay,
-            "1", totAmt, "INR", "", totAmt, tax, totAmt, clean(b.memo), tallyCat, "", ""
-          ]);
-        }
-      }
-      if (newRows.length > 0) {
-        const appended = await sheetAppendRows(env.SPREADSHEET_ID, "Purchase Bills", newRows, token);
-        totalNew += appended;
-      }
-    }
-  } catch (e: any) {
-    console.warn("Purchase Bills sync warning:", e.message);
-    if (e.message?.includes("401") || e.message?.includes("sign in")) {
-      authError = "Volopay session expired. Run 1-Click Desktop Sync to update";
-    }
-  }
-
-  // 4. Payrolls
-  try {
-    const payRes = await voloFetch("accounting/payrolls?page=1&limit=50", auth, env);
-    const payList = payRes.list || payRes.data || [];
-    if (payList.length > 0) {
-      const existingPay = await getRecentSheetRows(env.SPREADSHEET_ID, "Payrolls", token);
-      const existingKeys = new Set(existingPay.map(r => `${clean(r[0])}_${clean(r[4])}_${clean(r[5])}`));
-      const newRows: string[][] = [];
-      for (const p of payList) {
-        const empId = clean(p.accountingId || p.id);
-        const txnDate = normalizeDate(p.transactionDate || p.paymentDate);
-        const totAmt = clean(p.amount?.value || p.amount || "0");
-        const key = `${empId}_${txnDate}_${totAmt}`;
-        if (!existingKeys.has(key)) {
-          existingKeys.add(key);
-          const empObj = p.user || p.vendorOwner || {};
-          const empName = clean(typeof empObj === "object" ? empObj.name : (p.accountingVendorName || ""));
-          const empEmail = clean(typeof empObj === "object" ? empObj.email : "");
-          const memo = clean(p.note);
-          let tallyCat = "";
-          for (const tag of (p.accountingTags || [])) {
-            const val = tag?.tagValue || tag?.customTextValue || "";
-            if (val) { tallyCat = clean(val); break; }
-          }
-          newRows.push([
-            empId, empName, empEmail, "Payroll", txnDate, totAmt,
-            totAmt, "INR", "1.0", memo, memo, tallyCat, "", ""
-          ]);
-        }
-      }
-      if (newRows.length > 0) {
-        const appended = await sheetAppendRows(env.SPREADSHEET_ID, "Payrolls", newRows, token);
-        totalNew += appended;
-      }
-    }
-  } catch (e: any) {
-    console.warn("Payrolls sync warning:", e.message);
-    if (e.message?.includes("401") || e.message?.includes("sign in")) {
-      authError = "Volopay session expired. Run 1-Click Desktop Sync to update";
-    }
-  }
-
-  if (authError) {
-    return {
-      totalNew: 0,
-      summary: authError
-    };
-  }
-
-  return {
-    totalNew,
-    summary: totalNew > 0 ? `Volopay synced (${totalNew} new records appended to Sheets)` : `Volopay connected & up to date (0 new records)`
-  };
 }
 
 function b64(input: unknown) {
